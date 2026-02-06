@@ -902,6 +902,151 @@ function actionDelta(action) {
   }
 }
 
+// ============================================================================
+// v7.45 TASK 3: ARI & K-VALUE COMPUTATION + RECOVERY ADAPTATION
+// ============================================================================
+
+// v7.45 ARI: Compute block-level Average Relative Intensity
+// Formula: ARI = Σ(%1RM × reps) / Σ(reps) for all main lifts
+// This measures overall training stress across the entire block
+function computeBlockARI(block) {
+  if (!block || !block.weeks) return 0;
+  
+  let weightedPctSum = 0;
+  let repSum = 0;
+  
+  block.weeks.forEach((week, wIdx) => {
+    if (!week || !week.days) return;
+    
+    week.days.forEach((day, dIdx) => {
+      if (!day || !day.work) return;
+      
+      day.work.forEach((ex) => {
+        // Only count main lifts (snatch, C&J, squats)
+        const isMainLift = ['snatch', 'cj', 'bs', 'fs'].includes(ex.liftKey);
+        if (!isMainLift || !ex.pct || !ex.reps || !ex.sets) return;
+        
+        // Calculate total reps for this exercise
+        const totalReps = ex.sets * ex.reps;
+        if (totalReps <= 0) return;
+        
+        // Accumulate weighted intensity
+        repSum += totalReps;
+        weightedPctSum += ex.pct * totalReps;
+      });
+    });
+  });
+  
+  if (!repSum) return 0;
+  const ari = weightedPctSum / repSum;
+  console.log(`v7.45 ARI: Computed block ARI = ${(ari * 100).toFixed(1)}% (${repSum} total reps)`);
+  return ari; // Returns value like 0.78 = 78%
+}
+
+// v7.45 K-VALUE: Compute training load metric from ARI and two-lift total
+// K-value = ARI × 100 (simplified formula)
+// Higher K = higher training intensity
+function computeKValue(block, twoLiftTotal) {
+  if (!twoLiftTotal || twoLiftTotal <= 0) return null;
+  
+  const ARI = block.ari ?? computeBlockARI(block);
+  if (!ARI) return null;
+  
+  // K-value = ARI × 100
+  const kValue = ARI * 100;
+  console.log(`v7.45 K-VALUE: K = ${kValue.toFixed(1)} (ARI: ${(ARI * 100).toFixed(1)}%, Total: ${twoLiftTotal}kg)`);
+  return kValue;
+}
+
+// v7.45 RECOVERY: Get recent complex fatigue indicators
+// Scans set logs for high RPE and misses in complex exercises
+function getRecentComplexFatigueFlags() {
+  const logs = state.setLogs || {};
+  let highRpeCount = 0;
+  let missCount = 0;
+  let complexSetCount = 0;
+  
+  // Scan all logged sets
+  Object.values(logs).forEach(dayLog => {
+    if (!dayLog || typeof dayLog !== 'object') return;
+    
+    Object.values(dayLog).forEach(rec => {
+      if (!rec || typeof rec !== 'object') return;
+      
+      // Check if this was a complex exercise set
+      const exName = rec.exerciseName || rec.name || '';
+      if (!isComplex(exName)) return;
+      
+      complexSetCount++;
+      
+      // Check RPE (9+ is very high)
+      const rpe = Number(rec.rpe || 0);
+      if (rpe >= 9) highRpeCount++;
+      
+      // Check for misses
+      const action = String(rec.action || '').toLowerCase();
+      if (action === 'miss') missCount++;
+    });
+  });
+  
+  // Calculate fatigue score (0-1 scale)
+  const fatigueScore = complexSetCount > 0 
+    ? (highRpeCount + missCount * 2) / complexSetCount 
+    : 0;
+  
+  return { 
+    highRpeCount, 
+    missCount, 
+    complexSetCount,
+    fatigueScore
+  };
+}
+
+// v7.45 RECOVERY: Apply fatigue-based intensity reduction to complexes
+// Extra 5% reduction when athlete is fatigued
+function applyComplexFatigueAdjustment(pct, exName, fatigued) {
+  if (!isComplex(exName) || !pct || !fatigued) return pct;
+  
+  const adjusted = pct * 0.95;
+  console.log(`v7.45 Fatigue: ${exName} ${(pct * 100).toFixed(1)}% → ${(adjusted * 100).toFixed(1)}%`);
+  return adjusted;
+}
+
+// v7.45 RECOVERY: Downgrade complex structure when fatigued
+// Reduces rep count to manage fatigue
+function downgradeComplexIfFatigued(exName, fatigued) {
+  if (!fatigued || !isComplex(exName)) return exName;
+  
+  // Map 3-rep complexes to 2-rep versions
+  const downgrades = {
+    // Snatch downgrades (3-rep → 2-rep)
+    'Snatch Pull + Hang Snatch + Snatch': 'Snatch Pull + Snatch',
+    'Snatch High Pull + Hang Snatch + OHS': 'Snatch High Pull + Snatch',
+    'Low Hang Snatch + Hang Snatch + Snatch': 'Hang Snatch + Snatch',
+    'Hip Snatch + Hang Snatch + Snatch': 'Hang Snatch + Snatch',
+    'Halting Snatch Deadlift + Snatch Pull + Snatch': 'Snatch Pull + Snatch',
+    
+    // C&J downgrades
+    'Clean Pull + Hang Clean + Front Squat': 'Clean Pull + Clean',
+    'Clean Pull + Clean + Front Squat': 'Clean Pull + Clean',
+    'Clean + Front Squat + Clean': 'Clean + Front Squat',
+    'Low Hang Clean + Hang Clean + Clean': 'Hang Clean + Clean',
+    'Hip Clean + Hang Clean + Clean': 'Hang Clean + Clean',
+    'Power Clean + Clean + Jerk': 'Clean + Jerk',
+    'Block Clean + Clean + Jerk': 'Clean + Jerk',
+    'Clean + Front Squat + Jerk': 'Clean + Jerk',
+    'Clean + Jerk + Jerk': 'Clean + Jerk'
+  };
+  
+  const downgraded = downgrades[exName] || exName;
+  
+  if (downgraded !== exName) {
+    console.log(`v7.45 Fatigue: Downgraded ${exName} → ${downgraded}`);
+  }
+  
+  return downgraded;
+}
+
 const SWAP_POOLS = {
   snatch: [
     // Basic Variations
@@ -1015,6 +1160,350 @@ const SWAP_POOLS = {
     { name: 'Back Extension', liftKey: 'bs', recommendedPct: 0.40, description: '~40% of Back Squat' }
   ]
 };
+
+// v7.45 COMPLEX ENGINE: Structural definitions of Olympic complexes
+// Represents each complex as a sequence of movements with rep counts
+// Used for intelligent intensity capping and diagnostic selection
+const COMPLEX_DEFINITIONS = {
+  // SNATCH COMPLEXES
+  // Pull + Lift patterns (preparatory, pull emphasis)
+  'Snatch Pull + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'pull', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  'Snatch Pull + Hang Snatch + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'pull', reps: 1 },
+      { type: 'hang_snatch', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  'Snatch High Pull + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'high_pull', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  'Segment Snatch Pull + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'segment_pull', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  'Halting Snatch Deadlift + Snatch Pull + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'halting_deadlift', reps: 1 },
+      { type: 'pull', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  
+  // Lift + Squat patterns (receiving/strength emphasis)
+  'Snatch + OHS (pause)': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'snatch', reps: 1 },
+      { type: 'overhead_squat', reps: 1 }
+    ]
+  },
+  'Snatch + Snatch (1+1)': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'snatch', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  'Muscle Snatch + OHS': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'muscle_snatch', reps: 1 },
+      { type: 'overhead_squat', reps: 1 }
+    ]
+  },
+  'Snatch Balance + OHS': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'snatch_balance', reps: 1 },
+      { type: 'overhead_squat', reps: 1 }
+    ]
+  },
+  
+  // Position work (technique emphasis)
+  'Snatch High Pull + Hang Snatch + OHS': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'high_pull', reps: 1 },
+      { type: 'hang_snatch', reps: 1 },
+      { type: 'overhead_squat', reps: 1 }
+    ]
+  },
+  'Snatch (pause at knee) + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'pause_snatch', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  'Hang Snatch (above knee) + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'hang_snatch', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  'Tall Snatch + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'tall_snatch', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  'Low Hang Snatch + Hang Snatch + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'low_hang_snatch', reps: 1 },
+      { type: 'hang_snatch', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  'Hip Snatch + Hang Snatch + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'hip_snatch', reps: 1 },
+      { type: 'hang_snatch', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  'Power Snatch + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'power_snatch', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  'Block Snatch + Snatch': {
+    primaryLift: 'snatch',
+    pattern: [
+      { type: 'block_snatch', reps: 1 },
+      { type: 'snatch', reps: 1 }
+    ]
+  },
+  
+  // CLEAN & JERK COMPLEXES
+  // Pull + Clean patterns (preparatory, pull emphasis)
+  'Clean Pull + Clean': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'pull', reps: 1 },
+      { type: 'clean', reps: 1 }
+    ]
+  },
+  'Clean Pull + Hang Clean + Front Squat': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'pull', reps: 1 },
+      { type: 'hang_clean', reps: 1 },
+      { type: 'front_squat', reps: 1 }
+    ]
+  },
+  'Clean Pull + Clean + Front Squat': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'pull', reps: 1 },
+      { type: 'clean', reps: 1 },
+      { type: 'front_squat', reps: 1 }
+    ]
+  },
+  
+  // Clean + Squat patterns (receiving/strength emphasis)
+  'Clean + Front Squat': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'clean', reps: 1 },
+      { type: 'front_squat', reps: 1 }
+    ]
+  },
+  'Clean + Front Squat + Clean': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'clean', reps: 1 },
+      { type: 'front_squat', reps: 1 },
+      { type: 'clean', reps: 1 }
+    ]
+  },
+  'Clean + Front Squat (2 reps)': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'clean', reps: 1 },
+      { type: 'front_squat', reps: 2 }
+    ]
+  },
+  
+  // Clean technique patterns
+  'Clean (pause at knee) + Clean': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'pause_clean', reps: 1 },
+      { type: 'clean', reps: 1 }
+    ]
+  },
+  'Hang Clean (above knee) + Clean': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'hang_clean', reps: 1 },
+      { type: 'clean', reps: 1 }
+    ]
+  },
+  'Tall Clean + Clean': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'tall_clean', reps: 1 },
+      { type: 'clean', reps: 1 }
+    ]
+  },
+  'Low Hang Clean + Hang Clean + Clean': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'low_hang_clean', reps: 1 },
+      { type: 'hang_clean', reps: 1 },
+      { type: 'clean', reps: 1 }
+    ]
+  },
+  'Hip Clean + Hang Clean + Clean': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'hip_clean', reps: 1 },
+      { type: 'hang_clean', reps: 1 },
+      { type: 'clean', reps: 1 }
+    ]
+  },
+  
+  // Jerk patterns (overhead stability emphasis)
+  'Clean + Jerk + Jerk': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'clean', reps: 1 },
+      { type: 'jerk', reps: 2 }
+    ]
+  },
+  'Jerk Dip Squat (pause) + Jerk': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'jerk_dip', reps: 1 },
+      { type: 'jerk', reps: 1 }
+    ]
+  },
+  'Power Jerk + Split Jerk': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'power_jerk', reps: 1 },
+      { type: 'split_jerk', reps: 1 }
+    ]
+  },
+  'Pause Jerk + Jerk': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'pause_jerk', reps: 1 },
+      { type: 'jerk', reps: 1 }
+    ]
+  },
+  'Split Jerk + Jerk Balance': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'split_jerk', reps: 1 },
+      { type: 'jerk_balance', reps: 1 }
+    ]
+  },
+  'Jerk from Blocks + Jerk': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'block_jerk', reps: 1 },
+      { type: 'jerk', reps: 1 }
+    ]
+  },
+  
+  // Full CJ patterns
+  'Clean + Front Squat + Jerk': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'clean', reps: 1 },
+      { type: 'front_squat', reps: 1 },
+      { type: 'jerk', reps: 1 }
+    ]
+  },
+  'Clean + Jerk (1+1)': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'clean', reps: 1 },
+      { type: 'jerk', reps: 1 }
+    ]
+  },
+  'Power Clean + Clean + Jerk': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'power_clean', reps: 1 },
+      { type: 'clean', reps: 1 },
+      { type: 'jerk', reps: 1 }
+    ]
+  },
+  'Block Clean + Clean + Jerk': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'block_clean', reps: 1 },
+      { type: 'clean', reps: 1 },
+      { type: 'jerk', reps: 1 }
+    ]
+  },
+  'Tempo Clean (3s) + Clean': {
+    primaryLift: 'cj',
+    pattern: [
+      { type: 'tempo_clean', reps: 1 },
+      { type: 'clean', reps: 1 }
+    ]
+  }
+};
+
+// v7.45 COMPLEX ENGINE: Get structural pattern for a complex
+// Returns pattern array or null if not a defined complex
+function getComplexPattern(exerciseName) {
+  if (!exerciseName) return null;
+  return COMPLEX_DEFINITIONS[exerciseName]?.pattern || null;
+}
+
+// v7.45 COMPLEX ENGINE: Calculate total reps in a complex
+// Sums all reps across all movements in the pattern
+function getComplexTotalReps(pattern) {
+  if (!pattern || !Array.isArray(pattern)) return 0;
+  return pattern.reduce((sum, movement) => sum + (movement.reps || 0), 0);
+}
+
+// v7.45 COMPLEX ENGINE: Apply rep-based intensity caps to complexes
+// Prevents overloading based on total volume per rep
+// Formula: ≤2 reps → 90%, =3 reps → 85%, 4-5 reps → 75%, 6+ reps → 70%
+function capComplexIntensity(pct, totalReps) {
+  if (!totalReps || totalReps <= 0) return pct;
+  
+  let cap;
+  if (totalReps <= 2) {
+    cap = 0.90; // High intensity work (singles, doubles)
+  } else if (totalReps === 3) {
+    cap = 0.85; // Moderate-high intensity
+  } else if (totalReps <= 5) {
+    cap = 0.75; // Moderate intensity (4-5 reps)
+  } else {
+    cap = 0.70; // Lower intensity (6+ reps, volume work)
+  }
+  
+  // Return the minimum of current percentage and the cap
+  return Math.min(pct, cap);
+}
 
 // v7.27: COMPREHENSIVE ACCESSORY EXERCISE DATABASE - ALL EXERCISES MAPPED
 const ACCESSORY_DATABASE = {
@@ -1626,6 +2115,132 @@ function phaseForWeek(weekIndex) {
   return 'deload';
 }
 
+// v7.45 COMPLEX ENGINE: Map phase to complex role
+// accumulation → "preparatory" (volume, technique)
+// intensification → "specific" (competition-like)
+// deload → "deload" (reduced complexity)
+function complexPhaseRole(phase) {
+  if (phase === 'accumulation') return 'preparatory';
+  if (phase === 'intensification') return 'specific';
+  return 'deload';
+}
+
+// v7.45 COMPLEX ENGINE: Diagnostic-driven complex selection
+// Chooses complex based on athlete limiter and training phase
+// Returns complex name or null (uses default chooseVariation logic)
+function chooseComplexForDay(kind, profile, phase) {
+  // Graceful degradation: if no limiter defined, return null
+  const limiter = profile?.limiter;
+  if (!limiter) {
+    console.log('v7.45: No limiter defined, using default variation selection');
+    return null;
+  }
+  
+  const role = complexPhaseRole(phase);
+  console.log(`v7.45: Selecting complex for ${kind} day, limiter: ${limiter}, phase: ${phase} (${role})`);
+  
+  // SNATCH DAY COMPLEXES
+  if (kind === 'snatch') {
+    // Pull limiter → emphasize pull work
+    if (limiter === 'pull') {
+      if (role === 'preparatory') {
+        // Accumulation: high-volume pull work
+        return 'Snatch Pull + Hang Snatch + Snatch';
+      } else if (role === 'specific') {
+        // Intensification: specific pull-to-lift
+        return 'Snatch Pull + Snatch';
+      }
+    }
+    
+    // Receiving/squat limiter → emphasize catch strength
+    if (limiter === 'receiving' || limiter === 'squat') {
+      if (role === 'preparatory') {
+        // Accumulation: build squat strength in position
+        return 'Snatch + OHS (pause)';
+      } else if (role === 'specific') {
+        // Intensification: competition rehearsal
+        return 'Snatch + Snatch (1+1)';
+      }
+    }
+    
+    // Overhead stability limiter → emphasize overhead work
+    if (limiter === 'overhead') {
+      if (role === 'preparatory') {
+        return 'Muscle Snatch + OHS';
+      } else if (role === 'specific') {
+        return 'Snatch Balance + OHS';
+      }
+    }
+    
+    // Position/timing limiter → emphasize positions
+    if (limiter === 'positions' || limiter === 'timing') {
+      if (role === 'preparatory') {
+        return 'Low Hang Snatch + Hang Snatch + Snatch';
+      } else if (role === 'specific') {
+        return 'Hang Snatch (above knee) + Snatch';
+      }
+    }
+  }
+  
+  // CLEAN & JERK DAY COMPLEXES
+  if (kind === 'cj') {
+    // Pull limiter → emphasize pull work
+    if (limiter === 'pull') {
+      if (role === 'preparatory') {
+        return 'Clean Pull + Hang Clean + Front Squat';
+      } else if (role === 'specific') {
+        return 'Clean Pull + Clean';
+      }
+    }
+    
+    // Receiving/squat limiter → emphasize clean recovery
+    if (limiter === 'receiving' || limiter === 'squat') {
+      if (role === 'preparatory') {
+        return 'Clean + Front Squat (2 reps)';
+      } else if (role === 'specific') {
+        return 'Clean + Front Squat + Clean';
+      }
+    }
+    
+    // Overhead/jerk limiter → emphasize jerk work
+    if (limiter === 'overhead' || limiter === 'jerk') {
+      if (role === 'preparatory') {
+        return 'Jerk Dip Squat (pause) + Jerk';
+      } else if (role === 'specific') {
+        return 'Clean + Jerk + Jerk';
+      }
+    }
+    
+    // Position/timing limiter → emphasize positions
+    if (limiter === 'positions' || limiter === 'timing') {
+      if (role === 'preparatory') {
+        return 'Low Hang Clean + Hang Clean + Clean';
+      } else if (role === 'specific') {
+        return 'Hang Clean (above knee) + Clean';
+      }
+    }
+    
+    // Full lift emphasis → complete complex
+    if (limiter === 'consistency' || limiter === 'full_lift') {
+      if (role === 'preparatory') {
+        return 'Clean + Front Squat + Jerk';
+      } else if (role === 'specific') {
+        return 'Power Clean + Clean + Jerk';
+      }
+    }
+  }
+  
+  // Deload phase → return null (simpler variations)
+  if (role === 'deload') {
+    console.log('v7.45: Deload phase, using simpler variations');
+    return null;
+  }
+  
+  // Default: no specific complex selection
+  console.log('v7.45: No specific complex match, using default variation');
+  return null;
+}
+
 function volumeFactorFor(profile, phase, weekIndex = 0) {
   const pref = profile.volumePref || 'reduced';
   const base = (pref === 'standard') ? 1.0 : (pref === 'minimal' ? 0.6 : 0.8);
@@ -1719,6 +2334,114 @@ const HYPERTROPHY_POOLS = {
     { name: 'Step-up', refLift: 'bs', refPct: 0.40, description: '~40% of BS' }
   ]
 };
+
+// ============================================================================
+// v7.45 TASK 4: POWERBUILDING VOLUME PLANNER
+// ============================================================================
+
+// v7.45 POWERBUILDING: Weekly hypertrophy set targets per muscle group
+// Targets scale with total training days (mainDays + accessoryDays)
+// These are WEEKLY totals distributed across training days
+const POWERBUILDING_WEEKLY_TARGETS = {
+  3: { // Minimal: 2 WL + 1 accessory
+    quads: 10,
+    posterior: 10,
+    upperBack: 12,
+    chest: 8,
+    delts: 10,
+    arms: 8,
+    core: 6
+  },
+  4: { // Standard: 3 WL + 1 accessory OR 2 WL + 2 accessory
+    quads: 12,
+    posterior: 12,
+    upperBack: 14,
+    chest: 10,
+    delts: 12,
+    arms: 10,
+    core: 8
+  },
+  5: { // Enhanced: 3-4 WL + 1-2 accessory
+    quads: 14,
+    posterior: 14,
+    upperBack: 16,
+    chest: 12,
+    delts: 14,
+    arms: 12,
+    core: 8
+  },
+  6: { // Maximum: 3 WL + 3 accessory OR 4 WL + 2 accessory
+    quads: 16,
+    posterior: 16,
+    upperBack: 18,
+    chest: 14,
+    delts: 16,
+    arms: 14,
+    core: 10
+  }
+};
+
+// v7.45 POWERBUILDING: Map muscle groups to HYPERTROPHY_POOLS
+const MUSCLE_GROUP_TO_POOL = {
+  quads: 'lowerQuad',
+  posterior: 'lowerPosterior',
+  upperBack: 'upperPull',
+  chest: 'upperPush',
+  delts: 'shoulders',
+  arms: 'arms',
+  core: 'arms' // Placeholder - use arms pool for core work
+};
+
+// v7.45 POWERBUILDING: Estimate hypertrophy set budget per day
+// Based on session duration minus estimated WL time
+function estimateHypertrophySetBudget(durationMinutes, wlMinutes = 45) {
+  const spare = Math.max(0, durationMinutes - wlMinutes);
+  // Assume ~8 minutes per hypertrophy set (including rest)
+  const budget = Math.max(0, Math.floor(spare / 8));
+  return budget;
+}
+
+// v7.45 POWERBUILDING: Estimate week-level WL ARI for interference calculation
+// Only counts competition lifts (snatch/C&J), not squats/pulls
+function estimateWeekWLARI(weekPlan) {
+  if (!weekPlan || !weekPlan.days) return 0;
+  
+  let sumPct = 0;
+  let sumReps = 0;
+  
+  weekPlan.days.forEach(day => {
+    if (!day || !day.work) return;
+    
+    day.work.forEach(ex => {
+      // Only count competition lifts
+      const isWL = ex.liftKey === 'snatch' || ex.liftKey === 'cj';
+      if (!isWL || !ex.pct) return;
+      
+      const reps = (ex.sets || 0) * (ex.reps || 0);
+      if (!reps) return;
+      
+      sumReps += reps;
+      sumPct += ex.pct * reps;
+    });
+  });
+  
+  if (!sumReps) return 0;
+  return sumPct / sumReps;
+}
+
+// v7.45 POWERBUILDING: Calculate hypertrophy volume reduction multiplier
+// High WL intensity → reduce hypertrophy to prevent overtraining
+function hypertrophyInterferenceMultiplier(wlARI) {
+  if (wlARI >= 0.82) {
+    console.log(`v7.45 Powerbuilding: High WL ARI (${(wlARI * 100).toFixed(1)}%), -20% hypertrophy volume`);
+    return 0.8; // High stress → -20%
+  }
+  if (wlARI >= 0.78) {
+    console.log(`v7.45 Powerbuilding: Moderate WL ARI (${(wlARI * 100).toFixed(1)}%), -10% hypertrophy volume`);
+    return 0.9; // Moderate stress → -10%
+  }
+  return 1.0; // Normal stress → full volume
+}
 
 
 function pickFromPool(pool, key, weekIndex) {
@@ -2034,6 +2757,22 @@ function makeWeekPlan(profile, weekIndex) {
   const mainSet = new Set(mainDays.map(Number));
   const accClean = accessoryDays.map(Number).filter(d => !mainSet.has(d));
   
+  // v7.45 RECOVERY: Detect athlete fatigue for adaptive programming
+  const latestReadiness = (profile.readinessLog || []).slice(-1)[0]?.score ?? 3;
+  const { highRpeCount, missCount, fatigueScore } = getRecentComplexFatigueFlags();
+  
+  // Configurable fatigue thresholds
+  const complexFatigued = (
+    latestReadiness <= 2 ||      // Low readiness
+    highRpeCount >= 10 ||         // Too many high-RPE sets
+    missCount >= 5 ||             // Too many misses
+    fatigueScore >= 0.3           // Fatigue score > 30%
+  );
+  
+  if (complexFatigued) {
+    console.log(`v7.45 Recovery: Fatigue detected - readiness:${latestReadiness}, highRPE:${highRpeCount}, misses:${missCount}, score:${fatigueScore.toFixed(2)}`);
+  }
+  
   // v7.31: Balanced template selection for ALL day counts
   // Returns template index that ensures balanced snatch/C&J volume
   // v7.43 CRITICAL FIX #4: Rolling symmetry for 1-2 day frequencies
@@ -2068,17 +2807,89 @@ function makeWeekPlan(profile, weekIndex) {
     
     const templates = [
       // Template 0: Snatch Focus
-      { title: 'Snatch Focus', kind: 'snatch', main: 'Snatch', liftKey: 'snatch', work: [
-        { name: chooseVariation('snatch', profile, weekIndex, phase, 'snatch_main', dayIndex).name, liftKey: 'snatch', sets: Math.round(5 * volFactor), reps: 2, pct: intensity },
-        { name: chooseVariation('pull_snatch', profile, weekIndex, phase, 'snatch_pull', dayIndex).name, liftKey: 'snatch', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + getPullOffset(phase, 'snatch'), 0.65, 1.00) },
-        { name: chooseVariation('bs', profile, weekIndex, phase, 'back_squat', dayIndex).name, liftKey: 'bs', sets: Math.round(4 * volFactor), reps: 5, pct: clamp(intensity + 0.05, 0.55, 0.92) }
-      ]},
+      { title: 'Snatch Focus', kind: 'snatch', main: 'Snatch', liftKey: 'snatch', work: (() => {
+        // v7.45 COMPLEX ENGINE: Try diagnostic complex selection
+        let diagnosticComplex = chooseComplexForDay('snatch', profile, phase);
+        
+        // v7.45 RECOVERY: Downgrade complex if fatigued
+        if (diagnosticComplex && complexFatigued) {
+          diagnosticComplex = downgradeComplexIfFatigued(diagnosticComplex, true);
+        }
+        
+        let mainExercise;
+        if (diagnosticComplex) {
+          console.log(`v7.45: Using diagnostic complex: ${diagnosticComplex}`);
+          mainExercise = { name: diagnosticComplex, liftKey: 'snatch' };
+        } else {
+          mainExercise = chooseVariation('snatch', profile, weekIndex, phase, 'snatch_main', dayIndex);
+        }
+        
+        // Calculate intensity with complex adjustments
+        let mainIntensity = intensity;
+        
+        // v7.45 COMPLEX ENGINE: Apply complex intensity reductions
+        if (isComplex(mainExercise.name)) {
+          const pattern = getComplexPattern(mainExercise.name);
+          if (pattern) {
+            const totalReps = getComplexTotalReps(pattern);
+            mainIntensity = mainIntensity * 0.95; // Complex hardness
+            mainIntensity = capComplexIntensity(mainIntensity, totalReps); // Rep-based cap
+            mainIntensity = applyComplexFatigueAdjustment(mainIntensity, mainExercise.name, complexFatigued); // v7.45 RECOVERY
+            console.log(`v7.45: Complex ${mainExercise.name} - ${totalReps} reps, ${(mainIntensity * 100).toFixed(1)}%`);
+          } else {
+            mainIntensity = mainIntensity * 0.95;
+            mainIntensity = applyComplexFatigueAdjustment(mainIntensity, mainExercise.name, complexFatigued); // v7.45 RECOVERY
+          }
+        }
+        
+        return [
+          { name: mainExercise.name, liftKey: 'snatch', sets: Math.round(5 * volFactor), reps: 2, pct: mainIntensity },
+          { name: chooseVariation('pull_snatch', profile, weekIndex, phase, 'snatch_pull', dayIndex).name, liftKey: 'snatch', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + getPullOffset(phase, 'snatch'), 0.65, 1.00) },
+          { name: chooseVariation('bs', profile, weekIndex, phase, 'back_squat', dayIndex).name, liftKey: 'bs', sets: Math.round(4 * volFactor), reps: 5, pct: clamp(intensity + 0.05, 0.55, 0.92) }
+        ];
+      })()},
       // Template 1: C&J Focus - v7.36: Increased sets from 4 to 5 for balance
-      { title: 'Clean & Jerk Focus', kind: 'cj', main: 'Clean & Jerk', liftKey: 'cj', work: [
-        { name: chooseVariation('cj', profile, weekIndex, phase, 'cj_main', dayIndex).name, liftKey: 'cj', sets: Math.round(5 * volFactor), reps: 1, pct: clamp(intensity + 0.05, 0.60, 0.95) },
-        { name: chooseVariation('pull_clean', profile, weekIndex, phase, 'clean_pull', dayIndex).name, liftKey: 'cj', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + getPullOffset(phase, 'clean'), 0.70, 1.05) },
-        { name: chooseVariation('fs', profile, weekIndex, phase, 'front_squat', dayIndex).name, liftKey: 'fs', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + 0.08, 0.55, 0.92) }
-      ]},
+      { title: 'Clean & Jerk Focus', kind: 'cj', main: 'Clean & Jerk', liftKey: 'cj', work: (() => {
+        // v7.45 COMPLEX ENGINE: Try diagnostic complex selection
+        let diagnosticComplex = chooseComplexForDay('cj', profile, phase);
+        
+        // v7.45 RECOVERY: Downgrade complex if fatigued
+        if (diagnosticComplex && complexFatigued) {
+          diagnosticComplex = downgradeComplexIfFatigued(diagnosticComplex, true);
+        }
+        
+        let mainExercise;
+        if (diagnosticComplex) {
+          console.log(`v7.45: Using diagnostic complex: ${diagnosticComplex}`);
+          mainExercise = { name: diagnosticComplex, liftKey: 'cj' };
+        } else {
+          mainExercise = chooseVariation('cj', profile, weekIndex, phase, 'cj_main', dayIndex);
+        }
+        
+        // Calculate intensity with complex adjustments
+        let mainIntensity = clamp(intensity + 0.05, 0.60, 0.95);
+        
+        // v7.45 COMPLEX ENGINE: Apply complex intensity reductions
+        if (isComplex(mainExercise.name)) {
+          const pattern = getComplexPattern(mainExercise.name);
+          if (pattern) {
+            const totalReps = getComplexTotalReps(pattern);
+            mainIntensity = mainIntensity * 0.95; // Complex hardness
+            mainIntensity = capComplexIntensity(mainIntensity, totalReps); // Rep-based cap
+            mainIntensity = applyComplexFatigueAdjustment(mainIntensity, mainExercise.name, complexFatigued); // v7.45 RECOVERY
+            console.log(`v7.45: Complex ${mainExercise.name} - ${totalReps} reps, ${(mainIntensity * 100).toFixed(1)}%`);
+          } else {
+            mainIntensity = mainIntensity * 0.95;
+            mainIntensity = applyComplexFatigueAdjustment(mainIntensity, mainExercise.name, complexFatigued); // v7.45 RECOVERY
+          }
+        }
+        
+        return [
+          { name: mainExercise.name, liftKey: 'cj', sets: Math.round(5 * volFactor), reps: 1, pct: mainIntensity },
+          { name: chooseVariation('pull_clean', profile, weekIndex, phase, 'clean_pull', dayIndex).name, liftKey: 'cj', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + getPullOffset(phase, 'clean'), 0.70, 1.05) },
+          { name: chooseVariation('fs', profile, weekIndex, phase, 'front_squat', dayIndex).name, liftKey: 'fs', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + 0.08, 0.55, 0.92) }
+        ];
+      })()},
       // Template 2: Strength + Positions (DEPRECATED - kept for backward compatibility only)
       { title: 'Strength + Positions', kind: 'strength', main: 'Back Squat', liftKey: 'bs', work: [
         { name: chooseVariation('bs', profile, weekIndex, phase, 'back_squat_strength', dayIndex).name, liftKey: 'bs', sets: Math.round(5 * volFactor), reps: 3, pct: clamp(intensity + 0.08, 0.55, 0.95) },
@@ -2086,12 +2897,47 @@ function makeWeekPlan(profile, weekIndex) {
         { name: chooseVariation('press', profile, weekIndex, phase, 'press', dayIndex).name, liftKey: chooseVariation('press', profile, weekIndex, phase, 'press', dayIndex).liftKey, sets: Math.round(4 * volFactor), reps: 5, pct: clamp(intensity - 0.12, 0.45, 0.80) }
       ]},
       // Template 3: Combined + Squat - v7.36: NEW for balanced volume across all programs
-      { title: 'Combined + Squat', kind: 'combined', main: 'Both Lifts', liftKey: 'snatch', work: [
-        { name: chooseVariation('snatch', profile, weekIndex, phase, 'snatch_skill', dayIndex).name, liftKey: 'snatch', sets: Math.round(4 * volFactor), reps: 2, pct: clamp(intensity - 0.05, 0.55, 0.88) },
-        { name: chooseVariation('cj', profile, weekIndex, phase, 'cj_skill', dayIndex).name, liftKey: 'cj', sets: Math.round(4 * volFactor), reps: 1, pct: clamp(intensity, 0.60, 0.90) },
-        { name: chooseVariation('bs', profile, weekIndex, phase, 'back_squat_combined', dayIndex).name, liftKey: 'bs', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + 0.08, 0.55, 0.95) },
-        { name: chooseVariation('press', profile, weekIndex, phase, 'press_accessory', dayIndex).name, liftKey: chooseVariation('press', profile, weekIndex, phase, 'press_accessory', dayIndex).liftKey, sets: Math.round(3 * volFactor), reps: 5, pct: clamp(intensity - 0.15, 0.40, 0.75) }
-      ]}
+      { title: 'Combined + Squat', kind: 'combined', main: 'Both Lifts', liftKey: 'snatch', work: (() => {
+        // v7.45 COMPLEX ENGINE: Try diagnostic complex selection
+        let diagnosticSnatchComplex = chooseComplexForDay('snatch', profile, phase);
+        
+        // v7.45 RECOVERY: Downgrade complex if fatigued
+        if (diagnosticSnatchComplex && complexFatigued) {
+          diagnosticSnatchComplex = downgradeComplexIfFatigued(diagnosticSnatchComplex, true);
+        }
+        
+        let snatchExercise;
+        if (diagnosticSnatchComplex) {
+          console.log(`v7.45: Combined day - diagnostic snatch complex: ${diagnosticSnatchComplex}`);
+          snatchExercise = { name: diagnosticSnatchComplex, liftKey: 'snatch' };
+        } else {
+          snatchExercise = chooseVariation('snatch', profile, weekIndex, phase, 'snatch_skill', dayIndex);
+        }
+        
+        // Calculate snatch intensity with complex adjustments
+        let snatchIntensity = clamp(intensity - 0.05, 0.55, 0.88);
+        
+        if (isComplex(snatchExercise.name)) {
+          const pattern = getComplexPattern(snatchExercise.name);
+          if (pattern) {
+            const totalReps = getComplexTotalReps(pattern);
+            snatchIntensity = snatchIntensity * 0.95;
+            snatchIntensity = capComplexIntensity(snatchIntensity, totalReps);
+            snatchIntensity = applyComplexFatigueAdjustment(snatchIntensity, snatchExercise.name, complexFatigued); // v7.45 RECOVERY
+            console.log(`v7.45: Combined snatch complex - ${totalReps} reps, ${(snatchIntensity * 100).toFixed(1)}%`);
+          } else {
+            snatchIntensity = snatchIntensity * 0.95;
+            snatchIntensity = applyComplexFatigueAdjustment(snatchIntensity, snatchExercise.name, complexFatigued); // v7.45 RECOVERY
+          }
+        }
+        
+        return [
+          { name: snatchExercise.name, liftKey: 'snatch', sets: Math.round(4 * volFactor), reps: 2, pct: snatchIntensity },
+          { name: chooseVariation('cj', profile, weekIndex, phase, 'cj_skill', dayIndex).name, liftKey: 'cj', sets: Math.round(4 * volFactor), reps: 1, pct: clamp(intensity, 0.60, 0.90) },
+          { name: chooseVariation('bs', profile, weekIndex, phase, 'back_squat_combined', dayIndex).name, liftKey: 'bs', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + 0.08, 0.55, 0.95) },
+          { name: chooseVariation('press', profile, weekIndex, phase, 'press_accessory', dayIndex).name, liftKey: chooseVariation('press', profile, weekIndex, phase, 'press_accessory', dayIndex).liftKey, sets: Math.round(3 * volFactor), reps: 5, pct: clamp(intensity - 0.15, 0.40, 0.75) }
+        ];
+      })()}
     ];
     return templates[templateIndex % templates.length];
   };
