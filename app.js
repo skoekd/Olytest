@@ -6022,14 +6022,34 @@ function createDebouncedHandler(buttonId, asyncCallback, delay = 2000) {
 // ============================================================================
 
 function wireButtons() {
+  console.log('🔧 Wiring buttons...');
+  
+  // Navigation buttons - CRITICAL for UI functionality
+  const navButtons = [
+    { id: 'navSetup', handler: () => showPage('Setup') },
+    { id: 'navDashboard', handler: () => showPage('Dashboard') },
+    { id: 'navWorkout', handler: () => showPage('Workout') },
+    { id: 'navHistory', handler: () => showPage('History') },
+    { id: 'navSettings', handler: () => showPage('Settings') }
+  ];
+  
+  let navButtonsWired = 0;
+  navButtons.forEach(({ id, handler }) => {
+    const btn = $(id);
+    if (btn) {
+      btn.addEventListener('click', handler);
+      navButtonsWired++;
+    } else {
+      console.warn(`⚠️ Navigation button not found: ${id}`);
+    }
+  });
+  
+  console.log(`✓ Wired ${navButtonsWired}/${navButtons.length} navigation buttons`);
+  
+  // AI button
   $('btnAI')?.addEventListener('click', () => {
     openModal('🤖 AI Assistant', 'Placeholder', '<div class="help">AI features not enabled yet.</div>');
   });
-  $('navSetup')?.addEventListener('click', () => showPage('Setup'));
-  $('navDashboard')?.addEventListener('click', () => showPage('Dashboard'));
-  $('navWorkout')?.addEventListener('click', () => showPage('Workout'));
-  $('navHistory')?.addEventListener('click', () => showPage('History'));
-  $('navSettings')?.addEventListener('click', () => showPage('Settings'));
   $('setupProfileSelect')?.addEventListener('change', (e) => {
     setActiveProfile(e.target.value);
     renderSetup();
@@ -6762,10 +6782,14 @@ function boot() {
  * Handles events for dynamically created elements without re-binding
  */
 function setupGlobalEventDelegation() {
-  console.log('Setting up global event delegation...');
+  console.log('🌐 Setting up global event delegation...');
+  
+  let delegationActive = true;
   
   // Delegate all clicks on the document body
   document.body.addEventListener('click', function(e) {
+    if (!delegationActive) return;
+    
     let target = e.target;
     
     // Handle data-action attributes - check the target and its parents
@@ -6773,6 +6797,7 @@ function setupGlobalEventDelegation() {
     const actionElement = target.closest('[data-action]');
     if (actionElement) {
       const action = actionElement.getAttribute('data-action');
+      console.log(`🎯 data-action triggered: ${action}`);
       e.preventDefault();
       handleDataAction(action, actionElement);
       return;
@@ -6785,6 +6810,7 @@ function setupGlobalEventDelegation() {
       if (button.id.startsWith('daySelect_')) {
         const dayNum = parseInt(button.id.split('_')[1]);
         if (!isNaN(dayNum)) {
+          console.log(`📅 Day selection: ${dayNum}`);
           toggleDaySelection(dayNum);
           return;
         }
@@ -6794,6 +6820,7 @@ function setupGlobalEventDelegation() {
       if (button.id.startsWith('accDaySelect_')) {
         const dayNum = parseInt(button.id.split('_')[1]);
         if (!isNaN(dayNum)) {
+          console.log(`📅 Accessory day selection: ${dayNum}`);
           toggleAccessoryDaySelection(dayNum);
           return;
         }
@@ -6802,25 +6829,37 @@ function setupGlobalEventDelegation() {
   });
   
   console.log('✓ Global event delegation ready');
+  
+  // Make toggle available globally for debugging
+  window.toggleEventDelegation = () => {
+    delegationActive = !delegationActive;
+    console.log(`Event delegation ${delegationActive ? 'enabled' : 'disabled'}`);
+  };
 }
 
 /**
  * Handle data-action attributes
  */
 function handleDataAction(action, element) {
+  console.log(`⚡ handleDataAction called: ${action}`);
+  
   const actions = {
     'open-workout-detail': () => {
       const weekIndex = parseInt(element.getAttribute('data-week-index'));
       const dayIndex = parseInt(element.getAttribute('data-day-index'));
+      console.log(`  → Opening workout detail: week ${weekIndex}, day ${dayIndex}`);
       if (!isNaN(weekIndex) && !isNaN(dayIndex)) {
         const weekData = state.currentBlock?.weeks[weekIndex];
         if (weekData) {
           openWorkoutDetail(weekIndex, dayIndex, weekData.days[dayIndex]);
+        } else {
+          console.warn(`  → Week data not found for index ${weekIndex}`);
         }
       }
     },
     'toggle-set-complete': () => {
       const setKey = element.getAttribute('data-set-key');
+      console.log(`  → Toggling set complete: ${setKey}`);
       if (setKey) {
         toggleSetComplete(setKey);
       }
@@ -6828,6 +6867,7 @@ function handleDataAction(action, element) {
     'start-rest-timer': () => {
       const exerciseKey = element.getAttribute('data-exercise-key');
       const duration = parseInt(element.getAttribute('data-duration')) || 180;
+      console.log(`  → Starting rest timer: ${exerciseKey}, duration: ${duration}s`);
       if (exerciseKey) {
         startRestTimer(duration, exerciseKey);
       }
@@ -6839,8 +6879,10 @@ function handleDataAction(action, element) {
     try {
       handler();
     } catch (error) {
-      console.error(`Error handling action ${action}:`, error);
+      console.error(`❌ Error handling action ${action}:`, error);
     }
+  } else {
+    console.warn(`⚠️ Unknown action: ${action}`);
   }
 }
 
