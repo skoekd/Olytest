@@ -1,0 +1,10 @@
+{
+  "name": "LiftAI v7 — Olympic Weightlifting Planner",
+  "short_name": "LiftAI",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#0a0e1a",
+  "theme_color": "#0a0e1a",
+  "description": "Evidence-based Olympic weightlifting training planner with proper periodization",
+  "icons": []
+}
