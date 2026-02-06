@@ -1382,7 +1382,7 @@ body{ overflow-x:hidden; }
    */
   function isAppReady() {
     return (
-      typeof boot === 'function' &&
+      (typeof boot === 'function' || typeof window.initApp === 'function') &&
       typeof state !== 'undefined' &&
       typeof ui !== 'undefined' &&
       typeof $ === 'function'
@@ -1400,7 +1400,9 @@ body{ overflow-x:hidden; }
       console.log(`✓ App ready after ${initAttempts} attempts (${initAttempts * INIT_INTERVAL}ms)`);
       
       try {
-        boot();
+        // Use initApp if available, fallback to boot
+        const bootFunction = window.initApp || boot;
+        bootFunction();
         console.log('✓ Boot complete');
       } catch (error) {
         console.error('✗ Boot failed:', error);
@@ -1425,6 +1427,7 @@ body{ overflow-x:hidden; }
       console.error(`✗ Init timeout after ${MAX_INIT_ATTEMPTS * INIT_INTERVAL}ms`);
       console.error('Debug info:', {
         bootExists: typeof boot === 'function',
+        initAppExists: typeof window.initApp === 'function',
         stateExists: typeof state !== 'undefined',
         uiExists: typeof ui !== 'undefined',
         dollarExists: typeof $ === 'function'
