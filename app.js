@@ -156,22 +156,20 @@ async function pushToCloud() {
     const userId = getAnonymousUserId();
     const profile = getProfile();
     
-    // Get block name (use existing or create descriptive one)
+    // Get block name
     let blockName = state.currentBlock.name;
     if (!blockName || blockName.trim() === '') {
       const date = new Date().toLocaleDateString('en-US', { 
-        month: 'short', 
-        day: 'numeric', 
-        year: 'numeric' 
+        month: 'short', day: 'numeric', year: 'numeric' 
       });
       blockName = `${profile.programType || 'Training'} Block - ${date}`;
     }
     
-    // Prepare payload matching EXACT schema
+    // Prepare payload
     const payload = {
       user_id: userId,
       block_name: blockName,
-      block_data: state.currentBlock, // Supabase auto-converts to JSONB
+      block_data: state.currentBlock,
       profile_data: {
         maxes: profile.maxes,
         workingMaxes: profile.workingMaxes,
@@ -184,58 +182,147 @@ async function pushToCloud() {
       is_active: true
     };
     
-    // PATCH: Validate payload size (prevent 1MB+ blocks)
+    // Validate size
     const payloadSize = new Blob([JSON.stringify(payload)]).size;
-    const maxSize = 1024 * 1024; // 1MB limit
+    const maxSize = 1024 * 1024; // 1MB
     
     if (payloadSize > maxSize) {
       const sizeMB = (payloadSize / (1024 * 1024)).toFixed(2);
-      throw new Error(`Block too large (${sizeMB}MB). Maximum 1MB. Reduce block length or history.`);
+      throw new Error(`Block too large (${sizeMB}MB). Maximum 1MB.`);
     }
     
     console.log(`📤 Uploading ${(payloadSize / 1024).toFixed(1)}KB`, {
       user_id: payload.user_id,
-      block_name: payload.block_name,
-      block_data_keys: Object.keys(payload.block_data || {}),
-      profile_data_keys: Object.keys(payload.profile_data || {})
+      block_name: payload.block_name
     });
     
-    // PATCH: ATOMIC UPSERT using native PostgreSQL upsert
-    // This prevents race conditions by making it a single operation
-    const { data, error } = await supabaseClient
-      .from('training_blocks')
-      .upsert(payload, {
-        onConflict: 'user_id,block_name', // Requires UNIQUE constraint
-        ignoreDuplicates: false // We want to UPDATE, not ignore
-      })
-      .select()
-      .single();
+    // EMERGENCY HOTFIX: Try upsert first, fallback to manual check
+    let result;
+    let useUpsert = true;
     
-    if (error) {
-      console.error('Upsert error:', error);
+    try {
+      // Attempt atomic upsert (requires UNIQUE constraint)
+      const { data, error } = await supabaseClient
+        .from('training_blocks')
+        .upsert(payload, {
+          onConflict: 'user_id,block_name',
+          ignoreDuplicates: false
+        })
+        .select()
+        .single();
       
-      // Provide helpful error messages
-      if (error.code === '23505') {
-        // Unique violation - shouldn't happen with upsert, but just in case
-        throw new Error('Block name already exists. Please rename.');
-      } else if (error.code === '22P02') {
-        // Invalid JSONB
-        throw new Error('Block data format invalid. Please report this bug.');
+      if (error) {
+        console.error('Upsert error details:', {
+          message: error.message,
+          details: error.details,
+          hint: error.hint,
+          code: error.code
+        });
+        
+        // Check if error is due to missing constraint
+        if (error.message && (
+          error.message.includes('no unique or exclusion constraint') ||
+          error.message.includes('Conflict algorithm') ||
+          error.code === '42P10'
+        )) {
+          console.warn('⚠️ UNIQUE constraint missing - falling back to manual check');
+          useUpsert = false;
+        } else {
+          throw error;
+        }
       } else {
-        throw error;
+        result = data;
+      }
+    } catch (upsertError) {
+      console.error('Upsert attempt failed:', {
+        message: upsertError.message,
+        code: upsertError.code
+      });
+      useUpsert = false;
+    }
+    
+    // FALLBACK: Manual check and update/insert
+    if (!useUpsert) {
+      console.log('Using fallback: manual check and update/insert');
+      
+      // Check if exists
+      const { data: existing, error: searchError } = await supabaseClient
+        .from('training_blocks')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('block_name', blockName)
+        .maybeSingle();
+      
+      if (searchError) {
+        console.error('Search error:', searchError);
+        throw new Error(`Search failed: ${searchError.message}`);
+      }
+      
+      if (existing && existing.id) {
+        // Update
+        console.log('📝 Updating existing block:', existing.id);
+        
+        const { data, error } = await supabaseClient
+          .from('training_blocks')
+          .update(payload)
+          .eq('id', existing.id)
+          .select()
+          .single();
+        
+        if (error) {
+          console.error('Update error:', error);
+          throw new Error(`Update failed: ${error.message}`);
+        }
+        
+        result = data;
+        console.log('✅ Block updated');
+      } else {
+        // Insert
+        console.log('📝 Creating new block');
+        
+        const { data, error } = await supabaseClient
+          .from('training_blocks')
+          .insert([payload])
+          .select()
+          .single();
+        
+        if (error) {
+          console.error('Insert error:', error);
+          throw new Error(`Insert failed: ${error.message}`);
+        }
+        
+        result = data;
+        console.log('✅ Block created');
       }
     }
     
-    console.log('✅ Block saved atomically:', data);
+    if (!result) {
+      throw new Error('No data returned from save operation');
+    }
+    
+    console.log('✅ Save successful:', result);
     showCloudNotification('success', 'Block saved to cloud');
     
-    // Store last sync time for UI display
     localStorage.setItem('liftai_last_sync', new Date().toISOString());
     
   } catch (e) {
-    console.error('❌ Push to cloud failed:', e);
-    showCloudNotification('error', `Save failed: ${e.message}`);
-    throw e; // Re-throw for retry mechanism
+    // Improved error logging
+    console.error('❌ Push to cloud failed:', {
+      message: e.message,
+      stack: e.stack,
+      error: e
+    });
+    
+    // User-friendly error message
+    let errorMsg = 'Save failed';
+    if (e.message) {
+      errorMsg = e.message.length > 100 
+        ? e.message.substring(0, 100) + '...' 
+        : e.message;
+    }
+    
+    showCloudNotification('error', errorMsg);
+    throw e;
   }
 }
 
@@ -4780,25 +4867,35 @@ async function retryWithBackoff(operation, operationName = 'Operation', maxRetri
     try {
       return await operation();
     } catch (error) {
-      console.warn(`${operationName} attempt ${attempt}/${maxRetries} failed:`, error);
+      // EMERGENCY HOTFIX: Improved error logging
+      const errorDetails = {
+        message: error?.message || 'Unknown error',
+        code: error?.code,
+        details: error?.details,
+        attempt: attempt
+      };
       
-      // Don't retry on client errors (4xx) - only network/server errors
+      console.error(`${operationName} attempt ${attempt}/${maxRetries} failed:`, errorDetails);
+      
+      // Don't retry on client errors (4xx)
       if (error.code && error.code.toString().startsWith('4')) {
         console.error(`${operationName} failed with client error - not retrying:`, error.code);
         throw error;
       }
       
       if (attempt < maxRetries) {
-        // Exponential backoff: 1s, 2s, 4s (capped at 5s)
         const delay = Math.min(
           RETRY_CONFIG.baseDelay * Math.pow(2, attempt - 1),
           RETRY_CONFIG.maxDelay
         );
         
-        showCloudNotification('warning', `${operationName} failed. Retrying in ${delay/1000}s...`);
+        const errorMsg = error?.message || 'Unknown error';
+        showCloudNotification('warning', `${operationName} failed: ${errorMsg}. Retrying in ${delay/1000}s...`);
         await new Promise(resolve => setTimeout(resolve, delay));
       } else {
-        showCloudNotification('error', `${operationName} failed after ${maxRetries} attempts`);
+        const finalError = error?.message || 'Unknown error';
+        console.error(`${operationName} final failure:`, finalError);
+        showCloudNotification('error', `${operationName} failed after ${maxRetries} attempts: ${finalError}`);
         throw error;
       }
     }
