@@ -9,6 +9,7 @@
 <meta http-equiv="Pragma" content="no-cache"/>
 <meta http-equiv="Expires" content="0"/>
 <title>LiftAI v7 — Olympic Weightlifting Planner</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <link href="manifest.json" rel="manifest"/>
 <style>
 :root{--bg:#0a0e1a;--card:#111827;--card-hover:#1a2332;--border:#1f2937;--text:#f9fafb;--text-dim:#9ca3af;--primary:#3b82f6;--primary-dark:#2563eb;--success:#10b981;--warning:#f59e0b;--danger:#ef4444;--purple:#8b5cf6;--accent:#06b6d4}
@@ -575,6 +576,29 @@ body{ overflow-x:hidden; }
 
 .input.small{background:rgba(17,24,39,.8);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text);font-size:14px}
 
+
+/* Animation for notification indicators */
+@keyframes slideIn {
+  from {
+    transform: translateX(400px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes slideOut {
+  from {
+    transform: translateX(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateX(400px);
+    opacity: 0;
+  }
+}
 </style>
 </head>
 <body>
@@ -1191,9 +1215,13 @@ body{ overflow-x:hidden; }
 <div class="card-title">Overview</div>
 <div class="card-subtitle" id="dashboardSubtitle">—</div>
 <div class="stats-grid" id="dashboardStats" style="margin-top:14px"></div>
-<div class="flex" style="margin-top:14px">
+<div class="flex" style="margin-top:14px;gap:8px;flex-wrap:wrap">
 <button class="success" id="btnGoWorkout" style="flex:1">🏋️ Go to Workout</button>
-<button class="secondary" id="btnLogReadiness" title="Log readiness">💪 Readiness</button>
+<button class="secondary" id="btnExportCurrentBlock" title="Export current block">📤 Export</button>
+<button class="secondary" id="btnImportBlock" title="Import block from CSV">📥 Import</button>
+<button class="secondary" id="btnPushCloud" title="Save to cloud">☁️ Push</button>
+<button class="secondary" id="btnPullCloud" title="Load from cloud">☁️ Pull</button>
+<button class="secondary" id="btnLogReadiness" title="Log readiness">💪</button>
 </div>
 </div>
 <div class="card">
@@ -1204,6 +1232,8 @@ body{ overflow-x:hidden; }
 </div>
 
 </section>
+<input type="file" id="fileImportBlock" accept=".csv" style="display:none" />
+
 <!-- Workout Page -->
 <section class="hidden" id="pageWorkout">
 <div class="workout-section" id="tabWorkout">
@@ -1235,12 +1265,14 @@ body{ overflow-x:hidden; }
 <div class="flex-between" style="margin-bottom:16px">
 <div><div class="card-title">Training History</div><div class="card-subtitle">Completed sessions & saved blocks</div></div>
 <div style="display:flex;gap:8px">
-<button class="secondary small" id="btnImport">📥 Import</button>
+<button class="secondary small" id="btnImportBlock_History" title="Import training block from CSV">📥 Import Block</button>
+<button class="secondary small" id="btnImport" title="Import workout history from JSON">📥 Import JSON</button>
 </div>
 </div>
 <div id="historyList"></div>
 </div>
 <input type="file" id="fileImport" accept=".json" style="display:none" />
+<input type="file" id="fileImportCSV" accept=".csv" style="display:none" />
 </section>
 <section class="page hidden" id="pageSettings">
 <div class="card">
@@ -1335,6 +1367,118 @@ body{ overflow-x:hidden; }
 </section>
 </main>
 <script src="app.js"></script>
+<script>
+(function() {
+  'use strict';
+  
+  // Initialization state tracking
+  let initAttempts = 0;
+  const MAX_INIT_ATTEMPTS = 100; // 10 seconds max
+  const INIT_INTERVAL = 100; // Check every 100ms
+  
+  /**
+   * Check if all required globals are ready
+   * This prevents race conditions by verifying the script is fully parsed
+   */
+  function isAppReady() {
+    return (
+      typeof boot === 'function' &&
+      typeof state !== 'undefined' &&
+      typeof ui !== 'undefined' &&
+      typeof $ === 'function'
+    );
+  }
+  
+  /**
+   * Attempt to initialize the application
+   * Uses polling to ensure all dependencies are loaded
+   */
+  function tryInit() {
+    initAttempts++;
+    
+    if (isAppReady()) {
+      console.log(`✓ App ready after ${initAttempts} attempts (${initAttempts * INIT_INTERVAL}ms)`);
+      
+      try {
+        boot();
+        console.log('✓ Boot complete');
+      } catch (error) {
+        console.error('✗ Boot failed:', error);
+        // Show user-friendly error
+        document.body.insertAdjacentHTML('beforeend', 
+          `<div style="position:fixed;top:20px;left:50%;transform:translateX(-50%);
+           background:#ef4444;color:white;padding:16px 24px;border-radius:8px;
+           font-family:system-ui;z-index:99999;box-shadow:0 4px 12px rgba(0,0,0,0.3)">
+           ⚠️ App failed to start. Check console for details. 
+           <button onclick="location.reload()" style="margin-left:12px;padding:4px 12px;
+           background:white;color:#ef4444;border:none;border-radius:4px;cursor:pointer;
+           font-weight:600">Reload</button>
+          </div>`
+        );
+      }
+      
+      return true;
+    }
+    
+    // Timeout check
+    if (initAttempts >= MAX_INIT_ATTEMPTS) {
+      console.error(`✗ Init timeout after ${MAX_INIT_ATTEMPTS * INIT_INTERVAL}ms`);
+      console.error('Debug info:', {
+        bootExists: typeof boot === 'function',
+        stateExists: typeof state !== 'undefined',
+        uiExists: typeof ui !== 'undefined',
+        dollarExists: typeof $ === 'function'
+      });
+      
+      // Show timeout error to user
+      document.body.insertAdjacentHTML('beforeend',
+        `<div style="position:fixed;top:20px;left:50%;transform:translateX(-50%);
+         background:#ef4444;color:white;padding:16px 24px;border-radius:8px;
+         font-family:system-ui;z-index:99999;box-shadow:0 4px 12px rgba(0,0,0,0.3)">
+         ⚠️ App initialization timeout. Please reload the page.
+         <button onclick="location.reload()" style="margin-left:12px;padding:4px 12px;
+         background:white;color:#ef4444;border:none;border-radius:4px;cursor:pointer;
+         font-weight:600">Reload</button>
+        </div>`
+      );
+      
+      return true; // Stop trying
+    }
+    
+    return false;
+  }
+  
+  /**
+   * Start initialization sequence
+   * Uses requestIdleCallback when available for better performance
+   */
+  function startInit() {
+    console.log('🚀 Starting LiftAI initialization...');
+    
+    // Try immediate init if ready
+    if (isAppReady()) {
+      tryInit();
+      return;
+    }
+    
+    // Otherwise, poll until ready
+    const initTimer = setInterval(() => {
+      if (tryInit()) {
+        clearInterval(initTimer);
+      }
+    }, INIT_INTERVAL);
+  }
+  
+  // Wait for DOM to be fully ready
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startInit);
+  } else {
+    // DOM already loaded, start immediately
+    startInit();
+  }
+  
+})();
+</script>
 <nav aria-label="Primary" class="bottom-nav">
 <button class="nav-btn active" id="navSetup" type="button">🛠️<span>Setup</span></button>
 <button class="nav-btn" id="navDashboard" type="button">🏠<span>Dashboard</span></button>

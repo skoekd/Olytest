@@ -45,6 +45,523 @@ function notify(msg) {
   console.log(msg);
 }
 
+// ============================================================================
+// CLOUD SYNC - Minimal Implementation
+// ============================================================================
+
+// ============================================================================
+// SUPABASE CLOUD SYNC - REFACTORED FOR ACTUAL SCHEMA
+// ============================================================================
+
+const SUPABASE_URL = 'https://xbqlejwtfbeebucrdvqn.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhicWxland0ZmJlZWJ1Y3JkdnFuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzAwODgzODEsImV4cCI6MjA4NTY2NDM4MX0.1RdmT3twtadvxTjdepaqSYaqZRFkOAMhWyRQOjf-Zp0';
+
+// Global Supabase client
+let supabaseClient = null;
+
+// Get anonymous user ID (stable across sessions)
+function getAnonymousUserId() {
+  let userId = localStorage.getItem('liftai_user_id');
+  if (!userId) {
+    // Create a stable user ID based on browser fingerprint
+    const timestamp = Date.now();
+    const random = Math.random().toString(36).substring(2, 15);
+    userId = `athlete_${timestamp}_${random}`;
+    localStorage.setItem('liftai_user_id', userId);
+    console.log('✓ Created new user ID:', userId);
+  }
+  return userId;
+}
+
+// Initialize Supabase with polling and timeout
+function initSupabase() {
+  let attempts = 0;
+  const maxAttempts = 50; // 50 attempts * 100ms = 5 seconds
+  
+  const pollInterval = setInterval(() => {
+    attempts++;
+    
+    // Check if window.supabase is available
+    if (window.supabase && window.supabase.createClient) {
+      try {
+        supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+        clearInterval(pollInterval);
+        console.log(`✅ Cloud sync ready (${attempts * 100}ms)`);
+        
+        // Test connection by attempting to query
+        testSupabaseConnection();
+        
+        // Show brief success indicator
+        showCloudNotification('success', '☁️ Cloud sync enabled');
+        
+      } catch (e) {
+        console.error('❌ Failed to initialize Supabase:', e);
+        clearInterval(pollInterval);
+        showCloudNotification('error', `Initialization failed: ${e.message}`);
+      }
+      return;
+    }
+    
+    // Timeout after 5 seconds
+    if (attempts >= maxAttempts) {
+      clearInterval(pollInterval);
+      console.warn(`⚠️ Cloud sync unavailable (timeout after ${maxAttempts * 100}ms)`);
+      showCloudNotification('warning', 'Cloud sync unavailable (app still works)');
+    }
+  }, 100);
+}
+
+// Test Supabase connection
+async function testSupabaseConnection() {
+  if (!supabaseClient) return;
+  
+  try {
+    const userId = getAnonymousUserId();
+    // Simple count query to test connection
+    const { count, error } = await supabaseClient
+      .from('training_blocks')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId);
+    
+    if (error) {
+      console.warn('⚠️ Supabase connection test failed:', error.message);
+      return false;
+    }
+    
+    console.log(`✓ Supabase connection verified (${count || 0} blocks found)`);
+    return true;
+  } catch (e) {
+    console.warn('⚠️ Connection test error:', e);
+    return false;
+  }
+}
+
+// Push current block to cloud
+async function pushToCloud() {
+  // Safety check
+  if (!supabaseClient) {
+    console.warn('Supabase not ready');
+    showCloudNotification('warning', 'Cloud sync not ready');
+    return;
+  }
+  
+  if (!state.currentBlock) {
+    showCloudNotification('warning', 'No block to save');
+    return;
+  }
+  
+  try {
+    showCloudNotification('info', 'Saving to cloud...');
+    
+    const userId = getAnonymousUserId();
+    const profile = getProfile();
+    
+    // Get block name (use existing or create descriptive one)
+    let blockName = state.currentBlock.name;
+    if (!blockName || blockName.trim() === '') {
+      const date = new Date().toLocaleDateString('en-US', { 
+        month: 'short', 
+        day: 'numeric', 
+        year: 'numeric' 
+      });
+      blockName = `${profile.programType || 'Training'} Block - ${date}`;
+    }
+    
+    // Prepare payload matching EXACT schema
+    const payload = {
+      user_id: userId,
+      block_name: blockName,
+      block_data: state.currentBlock, // Supabase auto-converts to JSONB
+      profile_data: {
+        maxes: profile.maxes,
+        workingMaxes: profile.workingMaxes,
+        units: profile.units,
+        programType: profile.programType,
+        volumePref: profile.volumePref,
+        blockLength: profile.blockLength,
+        athleteDetails: state.athleteDetails || null
+      },
+      is_active: true
+    };
+    
+    // PATCH: Validate payload size (prevent 1MB+ blocks)
+    const payloadSize = new Blob([JSON.stringify(payload)]).size;
+    const maxSize = 1024 * 1024; // 1MB limit
+    
+    if (payloadSize > maxSize) {
+      const sizeMB = (payloadSize / (1024 * 1024)).toFixed(2);
+      throw new Error(`Block too large (${sizeMB}MB). Maximum 1MB. Reduce block length or history.`);
+    }
+    
+    console.log(`📤 Uploading ${(payloadSize / 1024).toFixed(1)}KB`, {
+      user_id: payload.user_id,
+      block_name: payload.block_name,
+      block_data_keys: Object.keys(payload.block_data || {}),
+      profile_data_keys: Object.keys(payload.profile_data || {})
+    });
+    
+    // PATCH: ATOMIC UPSERT using native PostgreSQL upsert
+    // This prevents race conditions by making it a single operation
+    const { data, error } = await supabaseClient
+      .from('training_blocks')
+      .upsert(payload, {
+        onConflict: 'user_id,block_name', // Requires UNIQUE constraint
+        ignoreDuplicates: false // We want to UPDATE, not ignore
+      })
+      .select()
+      .single();
+    
+    if (error) {
+      console.error('Upsert error:', error);
+      
+      // Provide helpful error messages
+      if (error.code === '23505') {
+        // Unique violation - shouldn't happen with upsert, but just in case
+        throw new Error('Block name already exists. Please rename.');
+      } else if (error.code === '22P02') {
+        // Invalid JSONB
+        throw new Error('Block data format invalid. Please report this bug.');
+      } else {
+        throw error;
+      }
+    }
+    
+    console.log('✅ Block saved atomically:', data);
+    showCloudNotification('success', 'Block saved to cloud');
+    
+    // Store last sync time for UI display
+    localStorage.setItem('liftai_last_sync', new Date().toISOString());
+    
+  } catch (e) {
+    console.error('❌ Push to cloud failed:', e);
+    showCloudNotification('error', `Save failed: ${e.message}`);
+    throw e; // Re-throw for retry mechanism
+  }
+}
+
+// Pull blocks from cloud
+async function pullFromCloud() {
+  // Safety check
+  if (!supabaseClient) {
+    console.warn('Supabase not ready');
+    showCloudNotification('warning', 'Cloud sync not ready');
+    return;
+  }
+  
+  try {
+    showCloudNotification('info', 'Loading from cloud...');
+    
+    const userId = getAnonymousUserId();
+    
+    console.log('📥 Fetching blocks for user:', userId);
+    
+    // Fetch all active blocks for this user
+    const { data: blocks, error } = await supabaseClient
+      .from('training_blocks')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('is_active', true)
+      .order('id', { ascending: false }) // Most recent first (by creation order)
+      .limit(20);
+    
+    if (error) {
+      console.error('Fetch error:', error);
+      throw error;
+    }
+    
+    console.log(`✅ Fetched ${blocks?.length || 0} blocks`);
+    
+    if (!blocks || blocks.length === 0) {
+      showCloudNotification('info', 'No saved blocks found');
+      return;
+    }
+    
+    // Validate that blocks have the required data
+    const validBlocks = blocks.filter(b => {
+      const valid = b.block_data && typeof b.block_data === 'object';
+      if (!valid) {
+        console.warn('Invalid block data:', b);
+      }
+      return valid;
+    });
+    
+    if (validBlocks.length === 0) {
+      showCloudNotification('warning', 'Found blocks but data is invalid');
+      return;
+    }
+    
+    console.log(`✓ ${validBlocks.length} valid blocks ready to display`);
+    
+    // Show modal with blocks
+    showCloudBlocksModal(validBlocks);
+    
+  } catch (e) {
+    console.error('❌ Pull from cloud failed:', e);
+    showCloudNotification('error', `Load failed: ${e.message}`);
+  }
+}
+
+// Show modal with available blocks
+function showCloudBlocksModal(blocks) {
+  // Remove any existing modal
+  const existingModal = document.getElementById('cloudModal');
+  if (existingModal) existingModal.remove();
+  
+  const html = blocks.map(b => {
+    const blockLength = b.block_data?.blockLength || b.block_data?.weeks?.length || 0;
+    const programType = b.profile_data?.programType || 'general';
+    
+    return `
+      <div 
+        onclick="window.restoreFromCloud('${b.id}')" 
+        style="
+          padding: 14px 16px;
+          margin: 10px 0;
+          background: rgba(59,130,246,0.1);
+          border: 1px solid rgba(59,130,246,0.3);
+          border-radius: 10px;
+          cursor: pointer;
+          transition: all 0.2s;
+        "
+        onmouseover="this.style.background='rgba(59,130,246,0.2)'; this.style.borderColor='rgba(59,130,246,0.5)'"
+        onmouseout="this.style.background='rgba(59,130,246,0.1)'; this.style.borderColor='rgba(59,130,246,0.3)'"
+      >
+        <div style="font-weight: 600; font-size: 15px; margin-bottom: 4px;">
+          ${escapeHtml(b.block_name)}
+        </div>
+        <div style="font-size: 13px; color: #9ca3af;">
+          ${blockLength} weeks • ${programType}
+        </div>
+      </div>
+    `;
+  }).join('');
+  
+  const modal = document.createElement('div');
+  modal.id = 'cloudModal';
+  modal.style.cssText = `
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0,0,0,0.8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10000;
+    padding: 20px;
+    animation: fadeIn 0.2s ease-out;
+  `;
+  
+  modal.innerHTML = `
+    <div style="
+      background: #111827;
+      border-radius: 16px;
+      padding: 28px;
+      max-width: 520px;
+      width: 100%;
+      max-height: 80vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    ">
+      <h3 style="margin: 0 0 20px 0; font-size: 20px; font-weight: 700;">
+        ☁️ Saved Training Blocks
+      </h3>
+      <div style="
+        flex: 1;
+        overflow-y: auto;
+        margin: 0 -8px;
+        padding: 0 8px;
+      ">
+        ${html}
+      </div>
+      <button 
+        onclick="window.closeCloudModal()" 
+        style="
+          margin-top: 20px;
+          width: 100%;
+          padding: 12px;
+          background: #374151;
+          border: none;
+          border-radius: 10px;
+          color: white;
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: background 0.2s;
+        "
+        onmouseover="this.style.background='#4b5563'"
+        onmouseout="this.style.background='#374151'"
+      >
+        Cancel
+      </button>
+    </div>
+  `;
+  
+  modal.onclick = (e) => {
+    if (e.target === modal) window.closeCloudModal();
+  };
+  
+  document.body.appendChild(modal);
+}
+
+// Restore a block from cloud
+window.restoreFromCloud = async function(blockId) {
+  // Safety check
+  if (!supabaseClient) {
+    console.warn('Supabase not ready');
+    showCloudNotification('warning', 'Cloud sync not ready');
+    return;
+  }
+  
+  if (!blockId) {
+    console.error('No block ID provided');
+    return;
+  }
+  
+  try {
+    showCloudNotification('info', 'Restoring block...');
+    
+    console.log('📥 Restoring block:', blockId);
+    
+    const { data, error } = await supabaseClient
+      .from('training_blocks')
+      .select('*')
+      .eq('id', blockId)
+      .single();
+    
+    if (error) {
+      console.error('Restore error:', error);
+      throw error;
+    }
+    
+    if (!data) {
+      throw new Error('Block not found');
+    }
+    
+    console.log('✅ Block retrieved:', data);
+    
+    // Validate block data
+    if (!data.block_data || typeof data.block_data !== 'object') {
+      throw new Error('Invalid block data structure');
+    }
+    
+    // Restore block data to state
+    state.currentBlock = data.block_data;
+    
+    // Restore profile data if available
+    if (data.profile_data && typeof data.profile_data === 'object') {
+      const profile = getProfile();
+      
+      // Restore maxes
+      if (data.profile_data.maxes) {
+        profile.maxes = { ...profile.maxes, ...data.profile_data.maxes };
+      }
+      
+      // Restore working maxes
+      if (data.profile_data.workingMaxes) {
+        profile.workingMaxes = { ...profile.workingMaxes, ...data.profile_data.workingMaxes };
+      }
+      
+      // Restore other settings
+      if (data.profile_data.units) profile.units = data.profile_data.units;
+      if (data.profile_data.programType) profile.programType = data.profile_data.programType;
+      if (data.profile_data.volumePref) profile.volumePref = data.profile_data.volumePref;
+      if (data.profile_data.blockLength) profile.blockLength = data.profile_data.blockLength;
+      
+      console.log('✓ Profile data restored');
+    }
+    
+    // Save to localStorage
+    saveState();
+    
+    // Reset UI
+    ui.weekIndex = 0;
+    
+    // Refresh UI
+    if (typeof renderDashboard === 'function') renderDashboard();
+    if (typeof renderWorkout === 'function') renderWorkout();
+    if (typeof showPage === 'function') showPage('Dashboard');
+    
+    // Close modal
+    window.closeCloudModal();
+    
+    console.log('✅ Block restored successfully');
+    showCloudNotification('success', 'Block restored!');
+    
+  } catch (e) {
+    console.error('❌ Restore failed:', e);
+    showCloudNotification('error', `Restore failed: ${e.message}`);
+  }
+};
+
+// Close cloud modal
+window.closeCloudModal = function() {
+  const modal = document.getElementById('cloudModal');
+  if (modal) {
+    modal.style.animation = 'fadeOut 0.2s ease-in';
+    setTimeout(() => modal.remove(), 200);
+  }
+};
+
+// Helper: Escape HTML to prevent XSS
+function escapeHtml(unsafe) {
+  if (!unsafe) return '';
+  return unsafe
+    .toString()
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+// Helper: Show cloud notification
+function showCloudNotification(type, message) {
+  const colors = {
+    success: 'rgba(16, 185, 129, 0.95)',
+    error: 'rgba(239, 68, 68, 0.95)',
+    warning: 'rgba(245, 158, 11, 0.95)',
+    info: 'rgba(59, 130, 246, 0.95)'
+  };
+  
+  const color = colors[type] || colors.info;
+  
+  const notification = document.createElement('div');
+  notification.style.cssText = `
+    position: fixed;
+    bottom: 100px;
+    right: 20px;
+    background: ${color};
+    color: white;
+    padding: 14px 20px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 600;
+    z-index: 9999;
+    animation: slideIn 0.3s ease-out;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    max-width: 320px;
+  `;
+  notification.textContent = message;
+  
+  document.body.appendChild(notification);
+  
+  // Auto-dismiss
+  const duration = type === 'error' ? 5000 : 3000;
+  setTimeout(() => {
+    notification.style.animation = 'slideOut 0.3s ease-in';
+    setTimeout(() => notification.remove(), 300);
+  }, duration);
+}
+
+// ============================================================================
+// END SUPABASE CLOUD SYNC
+// ============================================================================
+// ============================================================================
+
+
 // v7.16 STAGE 4: Rest Timer
 let restTimer = {
   active: false,
@@ -704,35 +1221,159 @@ const DEFAULT_STATE = () => ({
   profiles: { Default: DEFAULT_PROFILE() },
   currentBlock: null,
   history: [],
-  setLogs: {}
+  setLogs: {},
+  workoutReadiness: {}, // v7.33: Per-workout readiness scores
+  blockHistory: [] // v7.24: Store completed blocks
 });
 
-let state = loadState();
+let state;
 let ui = { currentPage: 'Setup', weekIndex: 0 };
 
+// Safe state initialization with error handling
+try {
+  state = loadState();
+  console.log('✓ State loaded successfully');
+} catch (error) {
+  console.error('Failed to load state, using defaults:', error);
+  state = DEFAULT_STATE();
+  // Try to save the default state
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch (saveError) {
+    console.warn('Cannot save to localStorage:', saveError);
+  }
+}
+
+/**
+ * Calculate appropriate pull percentage offset based on phase and lift type
+ * Research: Catalyst Athletics, USAW, Soviet methodology, Torokhtiy programs
+ * 
+ * Olympic lifting pulls should be prescribed as percentages of the competition lift,
+ * with the offset varying by training phase:
+ * 
+ * ACCUMULATION: Lighter pulls (volume, technique focus)
+ * - Snatch Pulls: +5% (70-80% of Snatch)
+ * - Clean Pulls: +8% (75-85% of Clean/C&J)
+ * 
+ * INTENSIFICATION: Heavier pulls (strength development)
+ * - Snatch Pulls: +10% (85-95% of Snatch)
+ * - Clean Pulls: +15% (90-100% of Clean/C&J)
+ * 
+ * COMPETITION: Moderate pulls (peak performance, maintenance)
+ * - Snatch Pulls: +8% (88-98% of Snatch)
+ * - Clean Pulls: +12% (92-102% of Clean/C&J)
+ * 
+ * @param {string} phase - Training phase (accumulation, intensification, competition)
+ * @param {string} pullType - 'snatch' or 'clean'
+ * @returns {number} Percentage offset to add to base intensity
+ */
+function getPullOffset(phase, pullType) {
+  // Snatch pulls are generally lighter (more technique-limited)
+  // Clean pulls can be heavier (more strength-limited)
+  
+  if (phase === 'accumulation') {
+    // Focus: Volume, technique, position
+    // Research range: Snatch 70-80%, Clean 75-85%
+    return pullType === 'snatch' ? 0.05 : 0.08;
+  } 
+  else if (phase === 'intensification') {
+    // Focus: Strength development
+    // Research range: Snatch 85-95%, Clean 90-100%
+    return pullType === 'snatch' ? 0.10 : 0.15;
+  } 
+  else if (phase === 'competition' || phase === 'peaking') {
+    // Focus: Peak performance, maintenance
+    // Research range: Snatch 88-98%, Clean 92-102%
+    return pullType === 'snatch' ? 0.08 : 0.12;
+  }
+  
+  // Default fallback for unknown phases
+  return pullType === 'snatch' ? 0.08 : 0.10;
+}
+
 function loadState() {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  const parsed = raw ? safeJsonParse(raw, null) : null;
-  if (!parsed || typeof parsed !== 'object') return DEFAULT_STATE();
-  const s = Object.assign(DEFAULT_STATE(), parsed);
-  if (!s.profiles || typeof s.profiles !== 'object') {
-    s.profiles = { Default: DEFAULT_PROFILE() };
-  }
-  if (!s.activeProfile || !s.profiles[s.activeProfile]) {
-    s.activeProfile = Object.keys(s.profiles)[0] || 'Default';
-  }
-  Object.keys(s.profiles).forEach(profileName => {
-    const p = s.profiles[profileName];
-    const defaults = DEFAULT_PROFILE();
-    Object.keys(defaults).forEach(key => {
-      if (!(key in p)) p[key] = defaults[key];
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      console.log('No saved state found, using defaults');
+      return DEFAULT_STATE();
+    }
+    
+    const parsed = safeJsonParse(raw, null);
+    if (!parsed || typeof parsed !== 'object') {
+      console.warn('Invalid state data, using defaults');
+      return DEFAULT_STATE();
+    }
+    
+    const s = Object.assign(DEFAULT_STATE(), parsed);
+    
+    // Validate profiles
+    if (!s.profiles || typeof s.profiles !== 'object') {
+      console.warn('Invalid profiles, resetting to default');
+      s.profiles = { Default: DEFAULT_PROFILE() };
+    }
+    
+    // Validate active profile
+    if (!s.activeProfile || !s.profiles[s.activeProfile]) {
+      console.warn('Invalid active profile, selecting first available');
+      s.activeProfile = Object.keys(s.profiles)[0] || 'Default';
+      if (!s.profiles[s.activeProfile]) {
+        s.profiles.Default = DEFAULT_PROFILE();
+        s.activeProfile = 'Default';
+      }
+    }
+    
+    // Ensure all profiles have required fields
+    Object.keys(s.profiles).forEach(profileName => {
+      const p = s.profiles[profileName];
+      const defaults = DEFAULT_PROFILE();
+      Object.keys(defaults).forEach(key => {
+        if (!(key in p)) {
+          p[key] = defaults[key];
+        }
+      });
     });
-  });
-  return s;
+    
+    console.log('✓ State loaded and validated');
+    return s;
+    
+  } catch (error) {
+    console.error('Error loading state, using defaults:', error);
+    return DEFAULT_STATE();
+  }
 }
 
 function saveState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  try {
+    const serialized = JSON.stringify(state);
+    localStorage.setItem(STORAGE_KEY, serialized);
+    return true;
+  } catch (error) {
+    console.error('Failed to save state:', error);
+    
+    // Check for quota exceeded error
+    if (error.name === 'QuotaExceededError') {
+      console.warn('localStorage quota exceeded, attempting cleanup...');
+      
+      // Try to save a minimal version
+      try {
+        const minimal = {
+          version: state.version,
+          activeProfile: state.activeProfile,
+          profiles: state.profiles,
+          currentBlock: null // Drop current block to save space
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(minimal));
+        console.log('✓ Saved minimal state after quota error');
+        alert('Warning: Storage almost full. Some workout history may not be saved.');
+        return true;
+      } catch (minimalError) {
+        console.error('Even minimal save failed:', minimalError);
+      }
+    }
+    
+    return false;
+  }
 }
 
 function getProfile() {
@@ -907,17 +1548,31 @@ function pickFromPool(pool, key, weekIndex) {
   return pool[idx];
 }
 
-function chooseHypertrophyExercise(poolName, profile, weekIndex, slotKey) {
+// v7.30: Duplicate-aware pool picker
+function pickFromPoolExcluding(pool, key, weekIndex, excludeNames = []) {
+  if (!pool || pool.length === 0) return null;
+  
+  // Filter out excluded exercises
+  const availablePool = pool.filter(ex => !excludeNames.includes(ex.name));
+  if (availablePool.length === 0) return pool[0]; // Fallback if all excluded
+  
+  const h = hash32(String(key) + '|w' + String(weekIndex));
+  const idx = (h % (availablePool.length * 7)) % availablePool.length;
+  return availablePool[idx];
+}
+
+function chooseHypertrophyExercise(poolName, profile, weekIndex, slotKey, excludeNames = []) {
   const pool = HYPERTROPHY_POOLS[poolName] || [];
   if (pool.length === 0) return { name: poolName, refLift: '', refPct: 0, description: '' };
   
   // v7.11 FIX: Same exercise for ENTIRE BLOCK (4 weeks)
   // Remove weekIndex from key so exercise doesn't change weekly
   // This allows proper progression tracking
+  // v7.30 FIX: Add duplicate prevention via excludeNames
   const seed = Number(profile.lastBlockSeed || 0) || blockSeed() || 0;
   const key = `${seed}|hyp|${poolName}|${slotKey}|${profile.programType || 'general'}`;
   // Note: weekIndex removed - same exercise all 4 weeks
-  return pickFromPool(pool, key, 0) || pool[0];  // Use week 0 always
+  return pickFromPoolExcluding(pool, key, 0, excludeNames) || pool[0];  // Use week 0 always
 }
 
 // v7.11 NEW: Calculate hypertrophy progression parameters
@@ -946,8 +1601,9 @@ function getHypertrophyProgression(weekIndex, phase) {
 }
 
 // v7.11 NEW: Helper to create hypertrophy exercise with weight guidance
-function makeHypExercise(poolName, profile, weekIndex, slotKey, sets, reps, baseRIR, hypProg) {
-  const ex = chooseHypertrophyExercise(poolName, profile, weekIndex, slotKey);
+// v7.30 FIX: Added excludeNames parameter for duplicate prevention
+function makeHypExercise(poolName, profile, weekIndex, slotKey, sets, reps, baseRIR, hypProg, excludeNames = []) {
+  const ex = chooseHypertrophyExercise(poolName, profile, weekIndex, slotKey, excludeNames);
   return {
     name: ex.name,
     sets: sets,
@@ -963,45 +1619,175 @@ function makeHypExercise(poolName, profile, weekIndex, slotKey, sets, reps, base
 
 
 function microIntensityFor(profile, phase, weekIndex) {
-  const w = weekIndex % 4;
-  const mode = (profile.athleteMode || 'recreational');
+  // v7.43 CRITICAL FIX #2: Block length-adaptive intensity curve
+  const blockLength = Number(profile.blockLength) || 8;
+  const progressRatio = blockLength > 1 ? weekIndex / (blockLength - 1) : 0; // 0.0 to 1.0
+  
+  // v7.43 CRITICAL FIX #3: Training age safety ceiling
+  const trainingAge = Number(profile.trainingAge) || 1;
+  let intensityCap = 1.00; // Default: no cap
+  
+  if (trainingAge < 1) {
+    intensityCap = 0.75; // <1 year: Max 75% (technique focus)
+  } else if (trainingAge < 2) {
+    intensityCap = 0.85; // 1-2 years: Max 85% (skill consolidation)
+  } else if (trainingAge < 3) {
+    intensityCap = 0.90; // 2-3 years: Max 90% (strength building)
+  }
+  // 3+ years: No cap (full intensity range available)
+  
   const pt = (profile.programType || 'general');
+  let intensity = 0.70; // base
   
-  // Base intensities
-  let acc = [0.70, 0.74];
-  let intens = 0.85;
-  let del = 0.62;
-  if (mode === 'competition' || pt === 'competition') {
-    acc = [0.73, 0.77];
-    intens = 0.88;
-    del = 0.65;
+  // v7.43 FIX: Program-specific intensity curves adapted to block length
+  if (pt === 'competition') {
+    // Competition Prep: 70% → 95% over entire block length
+    const startIntensity = 0.70;
+    const peakIntensity = 0.95;
+    const range = peakIntensity - startIntensity;
+    // Exponential curve: slower start, faster finish (power of 0.8)
+    intensity = startIntensity + (range * Math.pow(progressRatio, 0.8));
   }
-  if (pt === 'powerbuilding') {
-    acc = [0.70, 0.75];
-    intens = 0.83;
-    del = 0.62;
+  else if (pt === 'maximum_strength') {
+    // Max Strength: 80% → 95% over block length
+    intensity = 0.80 + (0.15 * progressRatio);
   }
-  if (pt === 'hypertrophy') {
-    acc = [0.68, 0.72];
-    intens = 0.80;
-    del = 0.60;
+  else if (pt === 'powerbuilding') {
+    // Powerbuilding: 70% → 83% (moderate intensity)
+    intensity = 0.70 + (0.13 * progressRatio);
+  }
+  else if (pt === 'hypertrophy') {
+    // Hypertrophy: 68% → 80% (volume-focused)
+    intensity = 0.68 + (0.12 * progressRatio);
+  }
+  else {
+    // General: Phase-based with block adaptation
+    if (phase === 'accumulation') {
+      intensity = 0.70 + (0.10 * progressRatio); // 70% → 80%
+    } else if (phase === 'intensification') {
+      intensity = 0.78 + (0.10 * progressRatio); // 78% → 88%
+    } else {
+      intensity = 0.60; // deload
+    }
   }
   
-  // MESOCYCLE PROGRESSION: Wave-based intensity bumps
-  const waveNumber = Math.floor(weekIndex / 4); // Wave 0, 1, 2...
-  const intensityBump = waveNumber * 0.02; // +2% per wave
+  // v7.43 CRITICAL: Apply training age cap
+  intensity = Math.min(intensity, intensityCap);
   
-  let baseIntensity = 0;
-  if (phase === 'accumulation') baseIntensity = (w === 0 ? acc[0] : acc[1]);
-  else if (phase === 'intensification') baseIntensity = intens;
-  else baseIntensity = del;
+  // Additional cap at 95% for safety
+  intensity = Math.min(intensity, 0.95);
   
-  return Math.min(baseIntensity + intensityBump, 0.95); // Cap at 95%
+  return intensity;
 }
 
 function chooseVariation(family, profile, weekIndex, phase, slotKey, dayIndex = 0) {
   let pool = SWAP_POOLS[family] || [];
   if (pool.length === 0) return { name: slotKey, liftKey: '' };
+  
+  // v7.43 CRITICAL FIX #1: INJURY SAFETY FILTER
+  const injuries = Array.isArray(profile.injuries) ? profile.injuries : [];
+  
+  if (injuries.length > 0) {
+    const originalPoolSize = pool.length;
+    pool = pool.filter(ex => {
+      const name = (ex.name || '').toLowerCase();
+      
+      // SHOULDER INJURY: Block overhead positions under load
+      if (injuries.includes('shoulder')) {
+        if (name.includes('snatch') && !name.includes('pull') && !name.includes('power')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(shoulder - overhead catch)');
+          return false;
+        }
+        if ((name.includes('jerk') || name.includes('strict press')) && 
+            !name.includes('power jerk') && !name.includes('push jerk') && 
+            !name.includes('push press')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(shoulder - overhead press)');
+          return false;
+        }
+        if (name.includes('overhead squat') || name.includes('ohs')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(shoulder - OHS)');
+          return false;
+        }
+        if (name.includes('behind-the-neck') || name.includes('btn')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(shoulder - BTN)');
+          return false;
+        }
+      }
+      
+      // WRIST INJURY: Block front rack positions
+      if (injuries.includes('wrist')) {
+        if ((name.includes('front squat') || (name.includes('clean') && !name.includes('pull'))) &&
+            !name.includes('power')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(wrist - front rack)');
+          return false;
+        }
+      }
+      
+      // ELBOW INJURY: Block heavy pressing
+      if (injuries.includes('elbow')) {
+        if (name.includes('press') && !name.includes('leg press')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(elbow - pressing)');
+          return false;
+        }
+        if (name.includes('jerk')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(elbow - jerk lockout)');
+          return false;
+        }
+      }
+      
+      // KNEE INJURY: Block full depth movements
+      if (injuries.includes('knee')) {
+        if ((name.includes('squat') || name.includes('snatch') || name.includes('clean')) &&
+            !name.includes('power') && !name.includes('pause') && !name.includes('tempo')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(knee - full depth)');
+          return false;
+        }
+      }
+      
+      // BACK INJURY: Block heavy axial loading
+      if (injuries.includes('back')) {
+        if (name.includes('back squat') || name.includes('deadlift') || name.includes('good morning')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(back - axial load)');
+          return false;
+        }
+        if (name.includes('pull') && !name.includes('high pull')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(back - heavy pull)');
+          return false;
+        }
+      }
+      
+      // HIP INJURY: Block heavy squatting
+      if (injuries.includes('hip')) {
+        if (name.includes('squat') && !name.includes('tempo')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(hip - squatting)');
+          return false;
+        }
+      }
+      
+      // ANKLE INJURY: Block split positions
+      if (injuries.includes('ankle')) {
+        if (name.includes('jerk') && !name.includes('power jerk') && !name.includes('push jerk')) {
+          console.warn('🚫 INJURY FILTER: Blocked', ex.name, '(ankle - split stance)');
+          return false;
+        }
+      }
+      
+      return true;
+    });
+    
+    // Emergency fallback if ALL exercises filtered
+    if (pool.length === 0) {
+      console.error('⚠️ ALL EXERCISES FILTERED for', family, '! Using emergency fallback');
+      if (family === 'snatch') pool = [{ name: 'Power Snatch', liftKey: 'snatch' }];
+      else if (family === 'cj') pool = [{ name: 'Power Clean + Push Jerk', liftKey: 'cj' }];
+      else if (family === 'bs' || family === 'fs') pool = [{ name: 'Tempo Front Squat', liftKey: 'fs' }];
+      else pool = SWAP_POOLS[family];
+    }
+    
+    if (pool.length < originalPoolSize && weekIndex === 0 && dayIndex === 0) {
+      console.log(`✅ Injury filter: ${originalPoolSize} → ${pool.length} safe exercises for ${family}`);
+    }
+  }
   
   // Filter out block variations if user has includeBlocks set to false
   const allowBlocks = (profile.includeBlocks === true || profile.includeBlocks === undefined);
@@ -1010,31 +1796,13 @@ function chooseVariation(family, profile, weekIndex, phase, slotKey, dayIndex = 
       const name = (ex.name || '').toLowerCase();
       return !name.includes('block') && !name.includes('from blocks');
     });
-    // If all exercises were filtered out, use original pool
     if (pool.length === 0) pool = SWAP_POOLS[family];
   }
   
   const pt = (profile.programType || 'general');
   const mode = (profile.athleteMode || 'recreational');
   const preferSpecific = (mode === 'competition' || pt === 'competition');
-  
-  // CRITICAL FIX: Use profile.lastBlockSeed (the NEW seed being generated)
-  // NOT blockSeed() which returns the OLD currentBlock.seed during generation
   const seed = Number(profile.lastBlockSeed || 0) || blockSeed() || 0;
-  
-  // DEBUG LOGGING
-  if (family === 'snatch' && weekIndex === 0 && dayIndex === 0) {
-    console.log('🔍 EXERCISE SELECTION DEBUG:');
-    console.log('  family:', family);
-    console.log('  slotKey:', slotKey);
-    console.log('  seed:', seed);
-    console.log('  profile.lastBlockSeed:', profile.lastBlockSeed);
-    console.log('  blockSeed() [old block]:', blockSeed());
-    console.log('  dayIndex:', dayIndex);
-    console.log('  weekIndex:', weekIndex);
-  }
-  
-  // CRITICAL FIX: Include dayIndex to ensure different exercises on different days
   const key = `${seed}|${family}|${slotKey}|${phase}|${pt}|${mode}|d${dayIndex}`;
   
   if (preferSpecific && (phase === 'intensification')) {
@@ -1043,14 +1811,6 @@ function chooseVariation(family, profile, weekIndex, phase, slotKey, dayIndex = 
   }
   
   const selected = pickFromPool(pool, key, weekIndex) || pool[0];
-  
-  // DEBUG LOGGING
-  if (family === 'snatch' && weekIndex === 0 && dayIndex === 0) {
-    console.log('  key:', key);
-    console.log('  selected:', selected.name);
-    console.log('  pool size:', pool.length);
-  }
-  
   return selected;
 }
 
@@ -1094,42 +1854,127 @@ function makeWeekPlan(profile, weekIndex) {
   const mainSet = new Set(mainDays.map(Number));
   const accClean = accessoryDays.map(Number).filter(d => !mainSet.has(d));
   
+  // v7.31: Balanced template selection for ALL day counts
+  // Returns template index that ensures balanced snatch/C&J volume
+  // v7.43 CRITICAL FIX #4: Rolling symmetry for 1-2 day frequencies
+  const getBalancedTemplateIndex = (dayCount, dayIndex, weekIndex) => {
+    const patterns = {
+      1: [0, 1, 3],        // Single day: ROTATE across weeks
+      2: [0, 1, 3, 0, 1, 3], // 2 days: Full pattern over 3 weeks
+      3: [0, 1, 3],        // Sn, CJ, Combined - 2:1 ratio ✅
+      4: [0, 1, 0, 1],     // Sn, CJ, Sn, CJ - 2:1 with C&J 5 sets ✅
+      5: [0, 1, 3, 0, 1],  // Sn, CJ, Combined, Sn, CJ - consistent 2:1 ✅
+      6: [0, 1, 3, 0, 1, 3] // Sn, CJ, Combined, Sn, CJ, Combined - 2:1 ✅
+    };
+    
+    const pattern = patterns[dayCount] || patterns[6];
+    
+    // v7.43 FIX: For 1-2 day frequencies, rotate template based on WEEK
+    if (dayCount <= 2) {
+      const templateOffset = (weekIndex * dayCount) % pattern.length;
+      const effectiveIndex = (dayIndex + templateOffset) % pattern.length;
+      return pattern[effectiveIndex];
+    }
+    
+    // For 3+ days, use normal day-based rotation
+    return pattern[dayIndex % pattern.length];
+  };
+  
+  // v7.36: Removed useSnatchOnStrengthDay() - no longer needed with Combined template
+  
   // CRITICAL FIX: Generate exercise templates per-day, not once for whole week
   const generateMainTemplate = (templateIndex, dayIndex) => {
+    const dayCount = mainDays.length;
+    
     const templates = [
+      // Template 0: Snatch Focus
       { title: 'Snatch Focus', kind: 'snatch', main: 'Snatch', liftKey: 'snatch', work: [
         { name: chooseVariation('snatch', profile, weekIndex, phase, 'snatch_main', dayIndex).name, liftKey: 'snatch', sets: Math.round(5 * volFactor), reps: 2, pct: intensity },
-        { name: chooseVariation('pull_snatch', profile, weekIndex, phase, 'snatch_pull', dayIndex).name, liftKey: 'snatch', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + 0.10, 0.60, 0.95) },
+        { name: chooseVariation('pull_snatch', profile, weekIndex, phase, 'snatch_pull', dayIndex).name, liftKey: 'snatch', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + getPullOffset(phase, 'snatch'), 0.65, 1.00) },
         { name: chooseVariation('bs', profile, weekIndex, phase, 'back_squat', dayIndex).name, liftKey: 'bs', sets: Math.round(4 * volFactor), reps: 5, pct: clamp(intensity + 0.05, 0.55, 0.92) }
       ]},
+      // Template 1: C&J Focus - v7.36: Increased sets from 4 to 5 for balance
       { title: 'Clean & Jerk Focus', kind: 'cj', main: 'Clean & Jerk', liftKey: 'cj', work: [
-        { name: chooseVariation('cj', profile, weekIndex, phase, 'cj_main', dayIndex).name, liftKey: 'cj', sets: Math.round(4 * volFactor), reps: 1, pct: clamp(intensity + 0.05, 0.60, 0.95) },
-        { name: chooseVariation('pull_clean', profile, weekIndex, phase, 'clean_pull', dayIndex).name, liftKey: 'cj', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + 0.12, 0.60, 0.98) },
+        { name: chooseVariation('cj', profile, weekIndex, phase, 'cj_main', dayIndex).name, liftKey: 'cj', sets: Math.round(5 * volFactor), reps: 1, pct: clamp(intensity + 0.05, 0.60, 0.95) },
+        { name: chooseVariation('pull_clean', profile, weekIndex, phase, 'clean_pull', dayIndex).name, liftKey: 'cj', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + getPullOffset(phase, 'clean'), 0.70, 1.05) },
         { name: chooseVariation('fs', profile, weekIndex, phase, 'front_squat', dayIndex).name, liftKey: 'fs', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + 0.08, 0.55, 0.92) }
       ]},
+      // Template 2: Strength + Positions (DEPRECATED - kept for backward compatibility only)
       { title: 'Strength + Positions', kind: 'strength', main: 'Back Squat', liftKey: 'bs', work: [
         { name: chooseVariation('bs', profile, weekIndex, phase, 'back_squat_strength', dayIndex).name, liftKey: 'bs', sets: Math.round(5 * volFactor), reps: 3, pct: clamp(intensity + 0.08, 0.55, 0.95) },
         { name: chooseVariation('snatch', profile, weekIndex, phase, 'snatch_secondary', dayIndex).name, liftKey: 'snatch', sets: Math.round(4 * volFactor), reps: 2, pct: clamp(intensity - 0.02, 0.55, 0.90) },
         { name: chooseVariation('press', profile, weekIndex, phase, 'press', dayIndex).name, liftKey: chooseVariation('press', profile, weekIndex, phase, 'press', dayIndex).liftKey, sets: Math.round(4 * volFactor), reps: 5, pct: clamp(intensity - 0.12, 0.45, 0.80) }
+      ]},
+      // Template 3: Combined + Squat - v7.36: NEW for balanced volume across all programs
+      { title: 'Combined + Squat', kind: 'combined', main: 'Both Lifts', liftKey: 'snatch', work: [
+        { name: chooseVariation('snatch', profile, weekIndex, phase, 'snatch_skill', dayIndex).name, liftKey: 'snatch', sets: Math.round(4 * volFactor), reps: 2, pct: clamp(intensity - 0.05, 0.55, 0.88) },
+        { name: chooseVariation('cj', profile, weekIndex, phase, 'cj_skill', dayIndex).name, liftKey: 'cj', sets: Math.round(4 * volFactor), reps: 1, pct: clamp(intensity, 0.60, 0.90) },
+        { name: chooseVariation('bs', profile, weekIndex, phase, 'back_squat_combined', dayIndex).name, liftKey: 'bs', sets: Math.round(4 * volFactor), reps: 3, pct: clamp(intensity + 0.08, 0.55, 0.95) },
+        { name: chooseVariation('press', profile, weekIndex, phase, 'press_accessory', dayIndex).name, liftKey: chooseVariation('press', profile, weekIndex, phase, 'press_accessory', dayIndex).liftKey, sets: Math.round(3 * volFactor), reps: 5, pct: clamp(intensity - 0.15, 0.40, 0.75) }
       ]}
     ];
     return templates[templateIndex % templates.length];
   };
   
   // Build accessory template with no duplicates per day
+  // v7.43 CRITICAL FIX #6: Program-specific exercise descriptions
   const generateAccessoryTemplate = (dayIndex) => {
     const acc1 = chooseVariation('accessory', profile, weekIndex, phase, 'accessory_1', dayIndex);
     const acc2 = chooseVariationExcluding('accessory', profile, weekIndex, phase, 'accessory_2', [acc1.name], dayIndex);
+    
+    const programType = profile.programType || 'general';
+    
+    const enhanceDescription = (exercise) => {
+      let desc = exercise.description || '';
+      
+      if (programType === 'hypertrophy' || programType === 'powerbuilding') {
+        desc += ' | Tempo: 3-1-1-0 (slow eccentric)';
+        desc += ' | RIR: 1-2 (near failure)';
+        desc += ' | Focus: Muscle tension';
+      }
+      else if (programType === 'competition') {
+        desc += ' | Tempo: Explosive';
+        desc += ' | RIR: 3-4 (technical reserve)';
+        desc += ' | Focus: Speed & quality';
+      }
+      else if (programType === 'maximum_strength') {
+        desc += ' | Tempo: Controlled';
+        desc += ' | RIR: 2-3';
+        desc += ' | Focus: Stability';
+      }
+      
+      return desc;
+    };
+    
     return { title: 'Accessory + Core', kind: 'accessory', main: 'Accessory', liftKey: '', work: [
-      { name: acc1.name, liftKey: acc1.liftKey, recommendedPct: acc1.recommendedPct || 0, description: acc1.description || '', sets: Math.round(3 * volFactor), reps: 5, pct: 0 },
-      { name: acc2.name, liftKey: acc2.liftKey, recommendedPct: acc2.recommendedPct || 0, description: acc2.description || '', sets: Math.round(3 * volFactor), reps: 8, pct: 0 },
+      { 
+        name: acc1.name, 
+        liftKey: acc1.liftKey, 
+        recommendedPct: acc1.recommendedPct || 0, 
+        description: enhanceDescription(acc1), 
+        sets: Math.round(3 * volFactor), 
+        reps: programType === 'hypertrophy' ? 10 : 5, 
+        pct: 0 
+      },
+      { 
+        name: acc2.name, 
+        liftKey: acc2.liftKey, 
+        recommendedPct: acc2.recommendedPct || 0, 
+        description: enhanceDescription(acc2), 
+        sets: Math.round(3 * volFactor), 
+        reps: programType === 'hypertrophy' ? 12 : 8, 
+        pct: 0 
+      },
       { name: 'Core + Mobility', sets: 1, reps: 1, pct: 0 }
     ]};
   };
   
   const sessions = [];
+  const dayCount = mainDays.length;
   mainDays.map(Number).sort((a, b) => a - b).forEach((d, i) => {
-    const t = generateMainTemplate(i, i); // Generate unique template per day
+    // v7.31: Use balanced template selection instead of simple index
+    const balancedTemplateIndex = getBalancedTemplateIndex(dayCount, i, weekIndex);
+    const t = generateMainTemplate(balancedTemplateIndex, i);
     sessions.push({ ...t, dow: d });
   });
   accClean.sort((a, b) => a - b).forEach((d, i) => {
@@ -1158,11 +2003,14 @@ function makeWeekPlan(profile, weekIndex) {
         s.title = 'Hypertrophy + Pump';
         const dayKey = `d${si}`; // Use session index to differentiate days
         if (duration >= 90) {
+          // v7.30 FIX: Prevent duplicates from same pool
+          const sh1 = makeHypExercise('shoulders', profile, weekIndex, `hyp_acc_sh1_${dayKey}`, hypSets, 10, 2, hypProg);
+          const sh2 = makeHypExercise('shoulders', profile, weekIndex, `hyp_acc_sh2_${dayKey}`, hypSets, 15, 3, hypProg, [sh1.name]);
           s.work = [
             makeHypExercise('upperPush', profile, weekIndex, `hyp_acc_push_${dayKey}`, hypSets + 1, hypReps, 2, hypProg),
             makeHypExercise('upperPull', profile, weekIndex, `hyp_acc_pull_${dayKey}`, hypSets + 1, hypReps, 2, hypProg),
-            makeHypExercise('shoulders', profile, weekIndex, `hyp_acc_sh1_${dayKey}`, hypSets, 10, 2, hypProg),
-            makeHypExercise('shoulders', profile, weekIndex, `hyp_acc_sh2_${dayKey}`, hypSets, 15, 3, hypProg),
+            sh1,
+            sh2,
             makeHypExercise('lowerQuad', profile, weekIndex, `hyp_acc_quad_${dayKey}`, hypSets, 15, 3, hypProg),
             makeHypExercise('lowerPosterior', profile, weekIndex, `hyp_acc_post_${dayKey}`, hypSets, hypReps, 2, hypProg),
             { name: 'Core Circuit', sets: 3, reps: 1, pct: 0, tag: 'core' }
@@ -1191,9 +2039,12 @@ function makeWeekPlan(profile, weekIndex) {
         }
       } else if (s.kind === 'cj') {
         if (duration >= 90) {
+          // v7.30 FIX: Prevent duplicates from same pool
+          const pull1 = makeHypExercise('upperPull', profile, weekIndex, 'hyp_cj_pull1', hypSets, hypReps - 2, 2, hypProg);
+          const pull2 = makeHypExercise('upperPull', profile, weekIndex, 'hyp_cj_pull2', hypSets, hypReps, 2, hypProg, [pull1.name]);
           s.work = [...s.work,
-            makeHypExercise('upperPull', profile, weekIndex, 'hyp_cj_pull1', hypSets, hypReps - 2, 2, hypProg),
-            makeHypExercise('upperPull', profile, weekIndex, 'hyp_cj_pull2', hypSets, hypReps, 2, hypProg),
+            pull1,
+            pull2,
             makeHypExercise('shoulders', profile, weekIndex, 'hyp_cj_sh', hypSets, hypReps, 2, hypProg),
             makeHypExercise('arms', profile, weekIndex, 'hyp_cj_arm1', hypSets, hypReps, 3, hypProg)
           ];
@@ -1205,9 +2056,12 @@ function makeWeekPlan(profile, weekIndex) {
         }
       } else if (s.kind === 'strength') {
         if (duration >= 90) {
+          // v7.30 FIX: Prevent duplicates from same pool
+          const post1 = makeHypExercise('lowerPosterior', profile, weekIndex, 'hyp_st_post1', hypSets, hypReps - 2, 2, hypProg);
+          const post2 = makeHypExercise('lowerPosterior', profile, weekIndex, 'hyp_st_post2', hypSets, hypReps, 2, hypProg, [post1.name]);
           s.work = [...s.work,
-            makeHypExercise('lowerPosterior', profile, weekIndex, 'hyp_st_post1', hypSets, hypReps - 2, 2, hypProg),
-            makeHypExercise('lowerPosterior', profile, weekIndex, 'hyp_st_post2', hypSets, hypReps, 2, hypProg),
+            post1,
+            post2,
             makeHypExercise('lowerQuad', profile, weekIndex, 'hyp_st_quad', hypSets, hypReps - 2, 2, hypProg),
             { name: 'Calf Raises', sets: 4, reps: 15, pct: 0, tag: 'hypertrophy' }
           ];
@@ -1253,11 +2107,38 @@ function makeWeekPlan(profile, weekIndex) {
                          s.kind === 'cj' ? chooseVariation('pull_clean', profile, weekIndex, phase, `${s.kind}_support`) :
                          chooseVariation('bs', profile, weekIndex, phase, `${s.kind}_support`);
       s.work = [...s.work,
-        { name: supportLift.name, liftKey: supportLift.liftKey, sets: Math.round(3 * volFactor), reps: 3, pct: clamp(intensity + 0.15, 0.60, 0.98), tag: 'strength' }
+        { name: supportLift.name, liftKey: supportLift.liftKey, sets: Math.round(3 * volFactor), reps: 3, pct: clamp(intensity + getPullOffset(phase, s.kind === 'snatch' ? 'snatch' : 'clean'), 0.65, 1.05), tag: 'strength' }
       ];
     }
     
     // GENERAL/COMPETITION/TECHNIQUE: Keep standard templates (already optimal)
+  });
+  
+  // v7.43 CRITICAL FIX #5: DURATION-AWARE TEMPLATE ENFORCEMENT
+  sessions.forEach((s, si) => {
+    if (duration === 60) {
+      // "Short" (60 min) - Maximum 3 exercises per session
+      if (s.kind === 'accessory') {
+        s.work = []; // Remove ALL accessories (no time)
+        console.log('⏱ Duration: 60min → Removed accessory day');
+        return;
+      }
+      
+      // Main days: Enforce 3-exercise limit
+      if (s.work.length > 3) {
+        console.log(`⏱ Duration: 60min → Truncated ${s.title} from ${s.work.length} to 3 exercises`);
+        s.work = s.work.slice(0, 3);
+      }
+      
+      // Additional safety: Cap sets at 5 per exercise
+      s.work.forEach(ex => {
+        if (ex.sets > 5) {
+          console.log(`⏱ Duration: 60min → Reduced ${ex.name} sets from ${ex.sets} to 5`);
+          ex.sets = 5;
+        }
+      });
+    }
+    // 75min and 90min: No enforcement needed (already handled by program logic)
   });
     
   const days = sessions.map(s => {
@@ -1304,20 +2185,23 @@ function generateBlockFromSetup() {
   } else {
     profile.injuries = [];
   }
-  const sn = Number($('setupSnatch')?.value);
-  const cj = Number($('setupCleanJerk')?.value);
-  const fs = Number($('setupFrontSquat')?.value);
-  const bs = Number($('setupBackSquat')?.value);
-  const pushPress = Number($('setupPushPress')?.value) || 0;
-  const strictPress = Number($('setupStrictPress')?.value) || 0;
+  // v7.36: Add bounds checking helper for max inputs (0-999kg reasonable range)
+  const validateMax = (value) => Math.max(0, Math.min(999, value || 0));
+  
+  const sn = validateMax(Number($('setupSnatch')?.value));
+  const cj = validateMax(Number($('setupCleanJerk')?.value));
+  const fs = validateMax(Number($('setupFrontSquat')?.value));
+  const bs = validateMax(Number($('setupBackSquat')?.value));
+  const pushPress = validateMax(Number($('setupPushPress')?.value));
+  const strictPress = validateMax(Number($('setupStrictPress')?.value));
   
   // Optional custom 1RMs (null = use auto-calculated ratio)
-  const powerSnatch = Number($('setupPowerSnatch')?.value) || null;
-  const powerClean = Number($('setupPowerClean')?.value) || null;
-  const ohs = Number($('setupOHS')?.value) || null;
-  const hangSnatch = Number($('setupHangSnatch')?.value) || null;
-  const hangPowerSnatch = Number($('setupHangPowerSnatch')?.value) || null;
-  const hangClean = Number($('setupHangClean')?.value) || null;
+  const powerSnatch = validateMax(Number($('setupPowerSnatch')?.value)) || null;
+  const powerClean = validateMax(Number($('setupPowerClean')?.value)) || null;
+  const ohs = validateMax(Number($('setupOHS')?.value)) || null;
+  const hangSnatch = validateMax(Number($('setupHangSnatch')?.value)) || null;
+  const hangPowerSnatch = validateMax(Number($('setupHangPowerSnatch')?.value)) || null;
+  const hangClean = validateMax(Number($('setupHangClean')?.value)) || null;
   
   if ([sn, cj, fs, bs].some(v => !Number.isFinite(v) || v <= 0)) {
     alert('Please enter all four main 1RM values (Snatch, C&J, Front Squat, Back Squat).');
@@ -1342,6 +2226,13 @@ function generateBlockFromSetup() {
   // Save updated profile before generating block
   state.profiles[state.activeProfile] = profile;
   saveState();
+  
+  // v7.35: BUG FIX - Validate that at least one training day is selected
+  const mainDays = getSelectedDays('main');
+  if (mainDays.length === 0) {
+    alert('⚠️ Please select at least one training day before generating a block.');
+    return;
+  }
   
   const blockLength = clamp(profile.blockLength, 4, 12);
   const _seed = Date.now();
@@ -1495,27 +2386,33 @@ function getBaseForExercise(exerciseName, liftKey, profile) {
 function getBaseForExerciseInternal(exerciseName, liftKey, profile) {
   const nameLower = (exerciseName || '').toLowerCase();
   
-  // Check for custom 1RM first
-  const customMapping = {
-    'power snatch': 'powerSnatch',
-    'power clean': 'powerClean',
-    'overhead squat': 'ohs',
-    'hang power snatch': 'hangPowerSnatch',
-    'hang snatch': 'hangSnatch',
-    'hang clean': 'hangClean'
-  };
-  
-  for (const [exercise, key] of Object.entries(customMapping)) {
-    if (nameLower.includes(exercise)) {
-      const customValue = profile.maxes?.[key];
-      if (customValue != null && customValue > 0) {
-        // Use custom 1RM with adjustments
-        const adj = (profile.liftAdjustments && profile.liftAdjustments[liftKey]) ? Number(profile.liftAdjustments[liftKey]) : 0;
-        const capped = clamp(adj, -0.05, 0.05);
-        return customValue * (1 + capped);
+  // v7.38 CRITICAL FIX: For complexes, ALWAYS use liftKey (primary lift), NOT custom 1RMs
+  // Complexes are limited by the hardest component (e.g., "Power Snatch + Snatch" limited by full Snatch)
+  // Using a custom Power Snatch 1RM would severely underload the complex
+  // Research: Complexes prescribed at 70-85% of PRIMARY lift 1RM (Catalyst Athletics)
+  if (!isComplex(exerciseName)) {
+    // Check for custom 1RM first (ONLY for non-complex exercises)
+    const customMapping = {
+      'power snatch': 'powerSnatch',
+      'power clean': 'powerClean',
+      'overhead squat': 'ohs',
+      'hang power snatch': 'hangPowerSnatch',
+      'hang snatch': 'hangSnatch',
+      'hang clean': 'hangClean'
+    };
+    
+    for (const [exercise, key] of Object.entries(customMapping)) {
+      if (nameLower.includes(exercise)) {
+        const customValue = profile.maxes?.[key];
+        if (customValue != null && customValue > 0) {
+          // Use custom 1RM with adjustments
+          const adj = (profile.liftAdjustments && profile.liftAdjustments[liftKey]) ? Number(profile.liftAdjustments[liftKey]) : 0;
+          const capped = clamp(adj, -0.05, 0.05);
+          return customValue * (1 + capped);
+        }
+        // If no custom value, fall through to ratio calculation
+        break;
       }
-      // If no custom value, fall through to ratio calculation
-      break;
     }
   }
   
@@ -1523,14 +2420,28 @@ function getBaseForExerciseInternal(exerciseName, liftKey, profile) {
     // Use TRUE MAX for competition lifts and technical variations
     const trueMax = (profile.maxes && profile.maxes[liftKey]) ? Number(profile.maxes[liftKey]) : 0;
     
-    // Apply research-based ratios for variations without custom values
+    // v7.39 CRITICAL FIX: Ratio logic for complexes vs. singles
+    // For COMPLEXES: ratio determined by PRIMARY lift (liftKey)
+    // For SINGLES: ratio determined by exercise variation
     let ratio = 1.0;
-    if (nameLower.includes('power snatch')) ratio = 0.88;
-    else if (nameLower.includes('power clean')) ratio = 0.90;
-    else if (nameLower.includes('overhead squat')) ratio = 0.85;
-    else if (nameLower.includes('hang power snatch')) ratio = 0.80;
-    else if (nameLower.includes('hang snatch') && !nameLower.includes('power')) ratio = 0.95;
-    else if (nameLower.includes('hang clean') && !nameLower.includes('power')) ratio = 0.95;
+    
+    if (isComplex(exerciseName)) {
+      // Complex exercises: ratio based on PRIMARY lift (liftKey)
+      // "Power Snatch + Snatch" with liftKey='snatch' → ratio = 1.0
+      // "Power Clean + Jerk" with liftKey='cj' → ratio = 1.0
+      // The limiting factor in a complex is the HARDEST component (the primary lift)
+      ratio = 1.0; // Always 1.0 for complexes (already has 5% complex reduction)
+    } else {
+      // Single exercises: ratio based on exercise name
+      // "Power Snatch" → ratio = 0.88
+      // "Hang Clean" → ratio = 0.95
+      if (nameLower.includes('power snatch')) ratio = 0.88;
+      else if (nameLower.includes('power clean')) ratio = 0.90;
+      else if (nameLower.includes('overhead squat')) ratio = 0.85;
+      else if (nameLower.includes('hang power snatch')) ratio = 0.80;
+      else if (nameLower.includes('hang snatch') && !nameLower.includes('power')) ratio = 0.95;
+      else if (nameLower.includes('hang clean') && !nameLower.includes('power')) ratio = 0.95;
+    }
     
     const adj = (profile.liftAdjustments && Number(profile.liftAdjustments[liftKey])) ? Number(profile.liftAdjustments[liftKey]) : 0;
     const capped = clamp(adj, -0.05, 0.05);
@@ -1687,7 +2598,7 @@ function openWorkoutDetail(weekIndex, dayIndex, dayPlan) {
     
     head.innerHTML = `
       <div style="flex:1">
-        <div class="card-title"><span class="collapse-icon" style="margin-right:8px; user-select:none;">▶</span>${ex.name}</div>
+        <div class="card-title"><span class="collapse-icon" style="margin-right:8px; user-select:none;">▼</span>${ex.name}</div>
         <div class="card-subtitle">${workSets}×${ex.reps}${ex.pct && liftKey ? ` • ${Math.round(ex.pct*100)}%` : ''}${ex.targetRIR ? ` • RIR ${ex.targetRIR}` : ''}</div>
         ${recommendationText}
         <div data-rest-timer="ex${exIndex}" style="display:none; margin-top:10px; padding:12px 16px; background:rgba(59,130,246,0.15); border:2px solid rgba(59,130,246,0.5); border-radius:10px; font-size:20px; font-weight:700; text-align:center; letter-spacing:1px;"></div>
@@ -1712,7 +2623,120 @@ function openWorkoutDetail(weekIndex, dayIndex, dayPlan) {
         if (ei === exIndex && si >= nextScheme.length) delete dayLog[k];
       });
       persist();
-      openWorkoutDetail(weekIndex, dayIndex, dayPlan);
+      
+      // v7.42 CRITICAL FIX: Don't re-render entire modal - just update this card
+      // This prevents dropdown from closing when user clicks +/- Set
+      
+      // Update the subtitle with new set count
+      const subtitle = card.querySelector('.card-subtitle');
+      if (subtitle) {
+        subtitle.textContent = `${next}×${ex.reps}${ex.pct && liftKey ? ` • ${Math.round(ex.pct*100)}%` : ''}${ex.targetRIR ? ` • RIR ${ex.targetRIR}` : ''}`;
+      }
+      
+      // Rebuild ONLY the table body with new set count
+      tbody.innerHTML = '';
+      nextScheme.forEach((s, setIndex) => {
+        const recKey = `${exIndex}:${setIndex}`;
+        const rec = dayLog[recKey] || {};
+        const cumAdj = computeCumulativeAdj(dayLog, exIndex, setIndex, nextScheme);
+        const adjWeight = s.targetWeight ? roundTo(s.targetWeight * (1 + cumAdj), p.units === 'kg' ? 1 : 1) : 0;
+        const weightVal = (rec.weight != null && rec.weight !== '') ? rec.weight : (adjWeight || '');
+        const repsVal = (rec.reps != null && rec.reps !== '') ? rec.reps : (s.targetReps || '');
+        const rpeVal = (rec.rpe != null && rec.rpe !== '') ? rec.rpe : '';
+        const actionVal = rec.action || '';
+        const row = document.createElement('tr');
+        row.dataset.idx = String(setIndex);
+        row.innerHTML = `
+          <td style="padding:8px 6px; opacity:.9">${setIndex + 1}${s.tag === 'warmup' ? '<span style="opacity:.6">w</span>' : ''}</td>
+          <td style="padding:6px"><div style="display:flex; gap:8px; align-items:center;">
+            <input inputmode="decimal" class="input small" data-role="weight" placeholder="—" value="${weightVal}" />
+            <span style="opacity:.65; font-size:12px">${s.targetPct ? `${Math.round(s.targetPct*100)}%` : (s.tag || '')}</span>
+          </div></td>
+          <td style="padding:6px"><input inputmode="numeric" class="input small" data-role="reps" placeholder="—" value="${repsVal}" /></td>
+          <td style="padding:6px"><input inputmode="decimal" class="input small" data-role="rpe" placeholder="—" value="${rpeVal}" /></td>
+          <td style="padding:6px"><select class="input small" data-role="action">
+            <option value="">—</option><option value="make">✓</option><option value="belt">↑</option>
+            <option value="heavy">⚠︎</option><option value="miss">✕</option>
+          </select></td>
+        `;
+        
+        const wEl = row.querySelector('[data-role="weight"]');
+        const repsEl = row.querySelector('[data-role="reps"]');
+        const rpeEl = row.querySelector('[data-role="rpe"]');
+        const aEl = row.querySelector('[data-role="action"]');
+        
+        if (aEl) aEl.value = actionVal;
+        
+        // Re-attach all event listeners for this row
+        if (wEl) {
+          wEl.addEventListener('change', () => {
+            updateRec(setIndex, { weight: wEl.value, status: 'done' });
+            const entered = Number(wEl.value);
+            if (Number.isFinite(entered) && entered > 0 && nextScheme[setIndex]?.tag === 'work') {
+              for (let j = setIndex + 1; j < nextScheme.length; j++) {
+                if (nextScheme[j]?.tag !== 'work') continue;
+                const nextKey = `${exIndex}:${j}`;
+                const nextRec = dayLog[nextKey] || {};
+                if (nextRec.weight != null && nextRec.weight !== '') continue;
+                const nextRow = tbody.querySelector(`tr[data-idx="${j}"]`);
+                if (nextRow) {
+                  const nextWEl = nextRow.querySelector('[data-role="weight"]');
+                  if (nextWEl && !nextWEl.value) {
+                    nextWEl.value = String(entered);
+                    updateRec(j, { weight: entered });
+                  }
+                }
+              }
+            }
+            const firstWorkIdx = nextScheme.findIndex(x => x.tag === 'work');
+            if (nextScheme[setIndex]?.tag === 'work' && firstWorkIdx === setIndex) {
+              const prescribed = Number(adjWeight || s.targetWeight || 0);
+              if (Number.isFinite(entered) && entered > 0 && Number.isFinite(prescribed) && prescribed > 0) {
+                const off = clamp((entered / prescribed) - 1, -0.10, 0.10);
+                setWeightOffsetOverride(dayLog, exIndex, off);
+              }
+              if (ex.recommendedPct && ex.recommendedPct > 0 && !ex.pct && entered > 0 && nextScheme[setIndex]?.tag === 'work') {
+                if (!p.accessoryWeights) p.accessoryWeights = {};
+                p.accessoryWeights[ex.name] = entered;
+                saveState();
+              }
+            }
+          });
+        }
+        if (repsEl) {
+          repsEl.addEventListener('input', () => updateRec(setIndex, { reps: repsEl.value, status: 'done' }));
+        }
+        if (rpeEl) {
+          rpeEl.addEventListener('input', () => updateRec(setIndex, { rpe: rpeEl.value, status: 'done' }));
+        }
+        if (aEl) {
+          aEl.addEventListener('change', () => {
+            const actualWeight = Number(wEl.value);
+            updateRec(setIndex, { action: aEl.value, weight: actualWeight, status: 'done' });
+            if (nextScheme[setIndex]?.tag === 'work' && actualWeight > 0) {
+              const actionAdj = actionDelta(aEl.value);
+              let baseWeight = actualWeight * (1 + actionAdj);
+              for (let j = setIndex + 1; j < nextScheme.length; j++) {
+                if (nextScheme[j]?.tag !== 'work') continue;
+                const nextW = roundTo(baseWeight, p.units === 'kg' ? 1 : 1);
+                const nextRow = tbody.querySelector(`tr[data-idx="${j}"]`);
+                if (nextRow) {
+                  const nextWEl = nextRow.querySelector('[data-role="weight"]');
+                  if (nextWEl) {
+                    nextWEl.value = String(nextW);
+                    updateRec(j, { weight: nextW });
+                  }
+                }
+                baseWeight = nextW;
+              }
+            }
+          });
+        }
+        
+        tbody.appendChild(row);
+      });
+      
+      // Dropdown remains open - no re-render!
     };
     head.querySelector('[data-role="minusSet"]')?.addEventListener('click', (e) => { 
       e.preventDefault(); 
@@ -2063,7 +3087,8 @@ function openWorkoutDetail(weekIndex, dayIndex, dayPlan) {
           const deleteBtn = modalEl.querySelector('[data-action="delete"]');
           if (deleteBtn) {
             deleteBtn.addEventListener('click', () => {
-              if (confirm(`Permanently delete "${ex.name}"?`)) {
+              // v7.42 FIX: More explicit warning about data loss
+              if (confirm(`⚠️ Permanently delete "${ex.name}"?\n\nThis will delete all logged sets, weights, and notes for this exercise.\n\nThis action cannot be undone.`)) {
                 try {
                   const wk = state.currentBlock?.weeks?.[weekIndex];
                   const dy = wk?.days?.[dayIndex];
@@ -2486,12 +3511,28 @@ function renderWorkout() {
     
     // Day of week names
     const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-        console.log('Rendering workout - Main days:', mainDays.length, 'Accessory days:', accessoryDays.length);
     
-
+    // v7.34: Detect today's day of week (0 = Sunday, 6 = Saturday)
+    const todayDOW = new Date().getDay();
+    
+    // v7.34: Helper to estimate workout duration
+    const estimateDuration = (day) => {
+      const exerciseCount = day.work.length;
+      const hasOlympic = day.work.some(ex => 
+        ex.name.toLowerCase().includes('snatch') || 
+        ex.name.toLowerCase().includes('clean') ||
+        ex.name.toLowerCase().includes('jerk')
+      );
+      
+      // Olympic lifts take longer (more rest, technique)
+      if (hasOlympic) {
+        return exerciseCount >= 5 ? '90 min' : exerciseCount >= 3 ? '75 min' : '60 min';
+      }
+      return exerciseCount >= 4 ? '60 min' : '45 min';
+    };
     
     // Helper function to render a day card
-    const renderDayCard = (day, dayIndex, isAccessory = false) => {
+    const renderDayCard = (day, dayIndex, isAccessory = false, isToday = false) => {
       const isDone = isDayCompleted(ui.weekIndex, dayIndex);
       const card = document.createElement('div');
       card.className = `day-card-v2 ${isDone ? 'completed' : ''}`;
@@ -2500,25 +3541,83 @@ function renderWorkout() {
       const header = document.createElement('div');
       header.className = 'day-card-header';
       const badgeColor = isAccessory ? '#8b5cf6' : 'var(--primary)';
+      
+      // v7.33: Get readiness for this specific workout
+      const workoutKey = `${ui.weekIndex}_${dayIndex}`;
+      const readinessScore = (state.workoutReadiness && state.workoutReadiness[workoutKey]) || null;
+      const readinessEmoji = readinessScore ? 
+        (readinessScore < 2.5 ? '😴' : readinessScore < 3.5 ? '😐' : '💪') : '⚡';
+      const readinessColor = readinessScore ?
+        (readinessScore < 2.5 ? '#ef4444' : readinessScore < 3.5 ? '#f59e0b' : '#10b981') : '#6b7280';
+      const readinessLabel = readinessScore ?
+        (readinessScore < 2.5 ? 'Low' : readinessScore < 3.5 ? 'Normal' : 'High') : '';
+      
+      // v7.34: Estimate duration and decide if expanded
+      const duration = estimateDuration(day);
+      const shouldExpand = isToday && !isDone;
+      
       header.innerHTML = `
         <div class="day-header-left">
           <div class="day-number">${dayNames[day.dow % 7]}</div>
           <div class="mini-badge ${isAccessory ? '' : 'primary'}">${day.title}</div>
         </div>
         <div class="day-header-right">
-          <div class="day-stats">${isDone ? 'Completed' : 'Tap to view'}</div>
-          <div class="expand-icon">▾</div>
+          ${!isDone ? `<button class="readiness-btn-mini" data-week="${ui.weekIndex}" data-day="${dayIndex}" style="background:${readinessColor};border:none;padding:4px 8px;border-radius:4px;font-size:12px;cursor:pointer;margin-right:8px;font-weight:600;color:#fff" title="Set readiness">${readinessEmoji}${readinessLabel ? ' ' + readinessLabel : ''}</button>` : ''}
+          <div class="day-stats" style="font-size:12px;color:#9ca3af;margin-right:8px">${duration}</div>
+          <div class="day-stats">${isDone ? 'Completed' : shouldExpand ? 'Today' : 'Tap to view'}</div>
+          <div class="expand-icon">${shouldExpand ? '▴' : '▾'}</div>
         </div>
       `;
       
       const body = document.createElement('div');
       body.className = 'day-card-body';
-      const exercises = document.createElement('div');
-      exercises.className = 'exercise-list';
-      exercises.innerHTML = day.work.map(e => `<div class="ex-summary">${e.name}</div>`).join('');
+      
+      // v7.34: Show exercises with working weights if expanded
+      if (shouldExpand) {
+        body.style.display = 'block';
+        const exerciseList = document.createElement('div');
+        exerciseList.className = 'exercise-list';
+        
+        // Get profile for weight calculations
+        const profile = getProfile();
+        const maxes = profile.maxes;
+        
+        exerciseList.innerHTML = day.work.slice(0, 5).map(ex => {
+          const setsReps = `${ex.sets}×${ex.reps}`;
+          const pctStr = ex.pct > 0 ? `${Math.round(ex.pct * 100)}%` : '';
+          
+          // Calculate working weight
+          let weightStr = '';
+          if (ex.pct > 0 && ex.liftKey && maxes[ex.liftKey]) {
+            const workingWeight = Math.round(ex.pct * maxes[ex.liftKey]);
+            weightStr = `(${workingWeight}kg)`;
+          }
+          
+          return `<div class="ex-summary" style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+            <div style="flex:1">
+              <div style="font-weight:600;color:#fff;margin-bottom:2px">${ex.name}</div>
+              <div style="font-size:12px;color:#9ca3af">${setsReps} ${pctStr ? '@ ' + pctStr : ''} ${weightStr}</div>
+            </div>
+          </div>`;
+        }).join('');
+        
+        if (day.work.length > 5) {
+          exerciseList.innerHTML += `<div style="padding:8px 0;font-size:12px;color:#9ca3af">+ ${day.work.length - 5} more exercises</div>`;
+        }
+        
+        body.appendChild(exerciseList);
+      } else {
+        // Collapsed: just show exercise names
+        body.style.display = 'none';
+        const exercises = document.createElement('div');
+        exercises.className = 'exercise-list';
+        exercises.innerHTML = day.work.map(e => `<div class="ex-summary">${e.name}</div>`).join('');
+        body.appendChild(exercises);
+      }
       
       const actions = document.createElement('div');
       actions.className = 'day-card-actions';
+      actions.style.display = shouldExpand ? 'flex' : 'none';
       
       const btnComplete = document.createElement('button');
       btnComplete.className = 'btn-mini success';
@@ -2531,7 +3630,7 @@ function renderWorkout() {
       
       const btnView = document.createElement('button');
       btnView.className = 'btn-mini secondary';
-      btnView.textContent = 'View';
+      btnView.textContent = 'Full Details';
       btnView.addEventListener('click', (e) => {
         e.stopPropagation();
         openWorkoutDetail(ui.weekIndex, dayIndex, day);
@@ -2539,43 +3638,287 @@ function renderWorkout() {
       
       actions.appendChild(btnView);
       actions.appendChild(btnComplete);
-      body.appendChild(exercises);
       body.appendChild(actions);
       
       header.addEventListener('click', () => {
-        openWorkoutDetail(ui.weekIndex, dayIndex, day);
+        // v7.34: Toggle expand/collapse
+        const isExpanded = body.style.display !== 'none';
+        if (isExpanded) {
+          body.style.display = 'none';
+          header.querySelector('.expand-icon').textContent = '▾';
+          actions.style.display = 'none';
+        } else {
+          body.style.display = 'block';
+          header.querySelector('.expand-icon').textContent = '▴';
+          actions.style.display = 'flex';
+          
+          // Re-render exercises with weights if not already done
+          if (!body.querySelector('.ex-summary[style*="display:flex"]')) {
+            const profile = getProfile();
+            const maxes = profile.maxes;
+            const exerciseList = body.querySelector('.exercise-list');
+            
+            exerciseList.innerHTML = day.work.slice(0, 5).map(ex => {
+              const setsReps = `${ex.sets}×${ex.reps}`;
+              const pctStr = ex.pct > 0 ? `${Math.round(ex.pct * 100)}%` : '';
+              
+              let weightStr = '';
+              if (ex.pct > 0 && ex.liftKey && maxes[ex.liftKey]) {
+                const workingWeight = Math.round(ex.pct * maxes[ex.liftKey]);
+                weightStr = `(${workingWeight}kg)`;
+              }
+              
+              return `<div class="ex-summary" style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+                <div style="flex:1">
+                  <div style="font-weight:600;color:#fff;margin-bottom:2px">${ex.name}</div>
+                  <div style="font-size:12px;color:#9ca3af">${setsReps} ${pctStr ? '@ ' + pctStr : ''} ${weightStr}</div>
+                </div>
+              </div>`;
+            }).join('');
+            
+            if (day.work.length > 5) {
+              exerciseList.innerHTML += `<div style="padding:8px 0;font-size:12px;color:#9ca3af">+ ${day.work.length - 5} more exercises</div>`;
+            }
+          }
+        }
       });
+      
+      // v7.33: Readiness button handler
+      const readinessBtn = header.querySelector('.readiness-btn-mini');
+      if (readinessBtn) {
+        readinessBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openWorkoutReadinessModal(ui.weekIndex, dayIndex, day);
+        });
+      }
       
       card.appendChild(header);
       card.appendChild(body);
       return card;
     };
     
-    // Render main days section
-    if (mainDays.length > 0) {
-      const mainHeader = document.createElement('div');
-      mainHeader.innerHTML = '<div style="font-size:14px;font-weight:600;color:var(--primary);margin-bottom:12px;text-transform:uppercase;letter-spacing:0.5px">Main Training Days</div>';
-      weekCalendar.appendChild(mainHeader);
+    // v7.34: Separate today from other days
+    const todayMainDays = mainDays.filter(day => day.dow === todayDOW);
+    const otherMainDays = mainDays.filter(day => day.dow !== todayDOW);
+    const todayAccessoryDays = accessoryDays.filter(day => day.dow === todayDOW);
+    const otherAccessoryDays = accessoryDays.filter(day => day.dow !== todayDOW);
+    
+    // Render TODAY section (if any workouts today)
+    if (todayMainDays.length > 0 || todayAccessoryDays.length > 0) {
+      const todayHeader = document.createElement('div');
+      todayHeader.innerHTML = '<div style="font-size:16px;font-weight:700;color:var(--primary);margin-bottom:12px;text-transform:uppercase;letter-spacing:0.5px;display:flex;align-items:center;gap:8px"><span>🔥</span><span>TODAY</span></div>';
+      weekCalendar.appendChild(todayHeader);
       
-      mainDays.forEach((day) => {
+      todayMainDays.forEach((day) => {
         const dayIndex = w.days.indexOf(day);
-        weekCalendar.appendChild(renderDayCard(day, dayIndex, false));
+        weekCalendar.appendChild(renderDayCard(day, dayIndex, false, true));
+      });
+      
+      todayAccessoryDays.forEach((day) => {
+        const dayIndex = w.days.indexOf(day);
+        weekCalendar.appendChild(renderDayCard(day, dayIndex, true, true));
       });
     }
     
-    // Render accessory days section
-    if (accessoryDays.length > 0) {
-      const accHeader = document.createElement('div');
-      accHeader.innerHTML = '<div style="font-size:14px;font-weight:600;color:#8b5cf6;margin:24px 0 12px 0;text-transform:uppercase;letter-spacing:0.5px">Accessory Days</div>';
-      weekCalendar.appendChild(accHeader);
+    // Render THIS WEEK section (other days)
+    if (otherMainDays.length > 0 || otherAccessoryDays.length > 0) {
+      const weekHeader = document.createElement('div');
+      weekHeader.innerHTML = '<div style="font-size:14px;font-weight:600;color:#9ca3af;margin:24px 0 12px 0;text-transform:uppercase;letter-spacing:0.5px">THIS WEEK</div>';
+      weekCalendar.appendChild(weekHeader);
       
-      accessoryDays.forEach((day) => {
-        const dayIndex = w.days.indexOf(day);
-        weekCalendar.appendChild(renderDayCard(day, dayIndex, true));
-      });
+      // Render main days section
+      if (otherMainDays.length > 0) {
+        otherMainDays.forEach((day) => {
+          const dayIndex = w.days.indexOf(day);
+          weekCalendar.appendChild(renderDayCard(day, dayIndex, false, false));
+        });
+      }
+      
+      // Render accessory days
+      if (otherAccessoryDays.length > 0) {
+        otherAccessoryDays.forEach((day) => {
+          const dayIndex = w.days.indexOf(day);
+          weekCalendar.appendChild(renderDayCard(day, dayIndex, true, false));
+        });
+      }
+    }
+    
+    // If no workouts today, show all normally with section headers
+    if (todayMainDays.length === 0 && todayAccessoryDays.length === 0) {
+      // Render main days section
+      if (mainDays.length > 0) {
+        const mainHeader = document.createElement('div');
+        mainHeader.innerHTML = '<div style="font-size:14px;font-weight:600;color:var(--primary);margin-bottom:12px;text-transform:uppercase;letter-spacing:0.5px">Main Training Days</div>';
+        weekCalendar.appendChild(mainHeader);
+        
+        mainDays.forEach((day) => {
+          const dayIndex = w.days.indexOf(day);
+          weekCalendar.appendChild(renderDayCard(day, dayIndex, false, false));
+        });
+      }
+      
+      // Render accessory days section
+      if (accessoryDays.length > 0) {
+        const accHeader = document.createElement('div');
+        accHeader.innerHTML = '<div style="font-size:14px;font-weight:600;color:#8b5cf6;margin:24px 0 12px 0;text-transform:uppercase;letter-spacing:0.5px">Accessory Days</div>';
+        weekCalendar.appendChild(accHeader);
+        
+        accessoryDays.forEach((day) => {
+          const dayIndex = w.days.indexOf(day);
+          weekCalendar.appendChild(renderDayCard(day, dayIndex, true, false));
+        });
+      }
     }
 
   }
+}
+
+// v7.33: Per-workout readiness system
+window.openWorkoutReadinessModal = function openWorkoutReadinessModal(weekIndex, dayIndex, day) {
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);display:flex;align-items:center;justify-content:center;z-index:10000;padding:20px';
+  
+  const workoutKey = `${weekIndex}_${dayIndex}`;
+  const currentReadiness = (state.workoutReadiness && state.workoutReadiness[workoutKey]) || 3;
+  
+  modal.innerHTML = `
+    <div style="background:#1f2937;border-radius:16px;max-width:400px;width:100%;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,0.5)">
+      <div style="font-size:20px;font-weight:700;margin-bottom:8px;color:#fff">How are you feeling?</div>
+      <div style="font-size:14px;color:#9ca3af;margin-bottom:24px">${day.title} • Week ${weekIndex + 1}</div>
+      
+      <div style="display:flex;gap:8px;margin-bottom:24px;justify-content:space-between">
+        <button class="readiness-option" data-value="1" style="flex:1;padding:16px 8px;border:2px solid #374151;border-radius:12px;background:#111827;color:#fff;cursor:pointer;transition:all 0.2s;text-align:center">
+          <div style="font-size:24px;margin-bottom:4px">😴</div>
+          <div style="font-size:11px;font-weight:600">Exhausted</div>
+        </button>
+        <button class="readiness-option" data-value="2" style="flex:1;padding:16px 8px;border:2px solid #374151;border-radius:12px;background:#111827;color:#fff;cursor:pointer;transition:all 0.2s;text-align:center">
+          <div style="font-size:24px;margin-bottom:4px">😫</div>
+          <div style="font-size:11px;font-weight:600">Tired</div>
+        </button>
+        <button class="readiness-option" data-value="3" style="flex:1;padding:16px 8px;border:2px solid #10b981;border-radius:12px;background:#111827;color:#fff;cursor:pointer;transition:all 0.2s;text-align:center">
+          <div style="font-size:24px;margin-bottom:4px">😐</div>
+          <div style="font-size:11px;font-weight:600">Normal</div>
+        </button>
+        <button class="readiness-option" data-value="4" style="flex:1;padding:16px 8px;border:2px solid #374151;border-radius:12px;background:#111827;color:#fff;cursor:pointer;transition:all 0.2s;text-align:center">
+          <div style="font-size:24px;margin-bottom:4px">😊</div>
+          <div style="font-size:11px;font-weight:600">Good</div>
+        </button>
+        <button class="readiness-option" data-value="5" style="flex:1;padding:16px 8px;border:2px solid #374151;border-radius:12px;background:#111827;color:#fff;cursor:pointer;transition:all 0.2s;text-align:center">
+          <div style="font-size:24px;margin-bottom:4px">💪</div>
+          <div style="font-size:11px;font-weight:600">Excellent</div>
+        </button>
+      </div>
+      
+      <div id="readinessEffect" style="font-size:13px;color:#9ca3af;margin-bottom:20px;text-align:center;min-height:40px;line-height:1.4"></div>
+      
+      <div style="display:flex;gap:12px">
+        <button id="readinessCancel" style="flex:1;padding:12px;border:none;border-radius:8px;background:#374151;color:#fff;font-weight:600;cursor:pointer">Cancel</button>
+        <button id="readinessConfirm" style="flex:1;padding:12px;border:none;border-radius:8px;background:var(--primary);color:#fff;font-weight:600;cursor:pointer">Apply</button>
+      </div>
+    </div>
+  `;
+  
+  document.body.appendChild(modal);
+  
+  let selectedReadiness = currentReadiness;
+  
+  // Update effect text
+  const updateEffect = (value) => {
+    const effectEl = modal.querySelector('#readinessEffect');
+    if (value <= 2) {
+      effectEl.innerHTML = `<span style="color:#ef4444">⚠️ Volume -20%, Intensity -5%</span><br><span style="font-size:12px">Workout adjusted for recovery</span>`;
+    } else if (value >= 4) {
+      effectEl.innerHTML = `<span style="color:#10b981">✅ Volume +10%, Intensity +3%</span><br><span style="font-size:12px">Workout optimized for performance</span>`;
+    } else {
+      effectEl.innerHTML = `<span style="color:#10b981">✅ No adjustment</span><br><span style="font-size:12px">Workout as programmed</span>`;
+    }
+  };
+  
+  // Option button handlers
+  modal.querySelectorAll('.readiness-option').forEach(btn => {
+    if (parseInt(btn.dataset.value) === currentReadiness) {
+      btn.style.borderColor = 'var(--primary)';
+      btn.style.background = 'rgba(16, 185, 129, 0.1)';
+    }
+    
+    btn.addEventListener('click', () => {
+      modal.querySelectorAll('.readiness-option').forEach(b => {
+        b.style.borderColor = '#374151';
+        b.style.background = '#111827';
+      });
+      btn.style.borderColor = 'var(--primary)';
+      btn.style.background = 'rgba(16, 185, 129, 0.1)';
+      selectedReadiness = parseInt(btn.dataset.value);
+      updateEffect(selectedReadiness);
+    });
+  });
+  
+  updateEffect(selectedReadiness);
+  
+  // Cancel handler
+  modal.querySelector('#readinessCancel').addEventListener('click', () => {
+    document.body.removeChild(modal);
+  });
+  
+  // Confirm handler
+  modal.querySelector('#readinessConfirm').addEventListener('click', () => {
+    // Save readiness for this specific workout
+    if (!state.workoutReadiness) state.workoutReadiness = {};
+    state.workoutReadiness[workoutKey] = selectedReadiness;
+    
+    // Apply adjustment to the workout
+    applyReadinessAdjustment(weekIndex, dayIndex, selectedReadiness);
+    
+    saveState();
+    renderWorkout();
+    document.body.removeChild(modal);
+    
+    notify(`Readiness set: ${selectedReadiness === 1 ? 'Exhausted' : selectedReadiness === 2 ? 'Tired' : selectedReadiness === 3 ? 'Normal' : selectedReadiness === 4 ? 'Good' : 'Excellent'}`);
+  });
+  
+  // Close on backdrop click
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) {
+      document.body.removeChild(modal);
+    }
+  });
+};
+
+// v7.33: Apply readiness adjustment to workout
+function applyReadinessAdjustment(weekIndex, dayIndex, readinessScore) {
+  const block = state.currentBlock;
+  if (!block || !block.weeks[weekIndex] || !block.weeks[weekIndex].days[dayIndex]) return;
+  
+  const day = block.weeks[weekIndex].days[dayIndex];
+  
+  // Store original values if not already stored
+  if (!day.originalWork) {
+    day.originalWork = JSON.parse(JSON.stringify(day.work));
+  }
+  
+  // Reset to original first
+  day.work = JSON.parse(JSON.stringify(day.originalWork));
+  
+  // Apply adjustments based on readiness
+  if (readinessScore < 2.5) {
+    // Low readiness: -20% volume, -5% intensity
+    day.work.forEach(ex => {
+      ex.sets = Math.max(1, Math.floor(ex.sets * 0.8));
+      if (ex.pct > 0) {
+        ex.pct = Math.max(0.5, ex.pct - 0.05);
+      }
+    });
+  } else if (readinessScore > 3.5) {
+    // High readiness: +10% volume, +3% intensity
+    day.work.forEach(ex => {
+      ex.sets = Math.ceil(ex.sets * 1.1);
+      if (ex.pct > 0) {
+        ex.pct = Math.min(0.98, ex.pct + 0.03);
+      }
+    });
+  }
+  // Moderate (3) = no change
 }
 
 function renderHistory() {
@@ -2618,17 +3961,78 @@ function renderHistory() {
     // Load block as current
     card.querySelector('[data-action="load"]')?.addEventListener('click', (e) => {
       e.stopPropagation();
+      console.log('📋 Load Block: Button clicked, block ID:', block.id);
+      
       if (confirm(`Load this block as your current training block?\n\nThis will replace your current block.`)) {
-        state.currentBlock = JSON.parse(JSON.stringify(block));
+        console.log('📋 Load Block: User confirmed, transforming structure...');
         
-        // Reset to the appropriate week based on block's currentWeek or start from beginning
+        // v7.38 CRITICAL FIX: Transform history structure to current block structure
+        // blockHistory stores 'day.exercises' but currentBlock needs 'day.work'
+        // Same transformation as Redo button, but preserves completion status
+        const loadedBlock = {
+          seed: block.blockSeed || Date.now(),
+          profileName: block.profileName,
+          startDateISO: block.startDateISO || todayISO(),
+          programType: block.programType,
+          blockLength: block.blockLength,
+          weeks: block.weeks.map(week => ({
+            weekIndex: week.weekIndex,
+            phase: week.phase,
+            intensity: week.intensity || 0.75,
+            volFactor: week.volFactor || 0.8,
+            days: week.days.map(day => ({
+              title: day.title,
+              dow: day.dow,
+              kind: day.kind || (day.title.includes('Accessory') || day.title.includes('Hypertrophy') ? 'accessory' : 'snatch'),
+              liftKey: day.liftKey || '',
+              completed: day.completed || false,
+              completedDate: day.completedDate || null,
+              work: (day.exercises || day.work || []).map(ex => ({
+                name: ex.name,
+                sets: ex.sets,
+                reps: ex.reps,
+                pct: ex.prescribedPct ? ex.prescribedPct / 100 : (ex.pct || 0),
+                liftKey: ex.liftKey || '',
+                tag: ex.tag || 'work',
+                targetRIR: ex.targetRIR || null,
+                recommendedPct: ex.recommendedPct || 0,
+                description: ex.description || ''
+              }))
+            }))
+          }))
+        };
+        
+        console.log('📋 Load Block: Transformed block:', loadedBlock);
+        console.log('📋 Load Block: Weeks:', loadedBlock.weeks.length);
+        console.log('📋 Load Block: First week days:', loadedBlock.weeks[0]?.days.length);
+        console.log('📋 Load Block: First day work:', loadedBlock.weeks[0]?.days[0]?.work.length);
+        console.log('📋 Load Block: Program Type:', loadedBlock.programType);
+        
+        // v7.40 FIX: Set state FIRST, then save, then render
+        state.currentBlock = loadedBlock;
         ui.weekIndex = block.currentWeek || 0;
         
+        console.log('📋 Load Block: State updated, currentBlock.programType:', state.currentBlock.programType);
+        
+        console.log('📋 Load Block: Saving state...');
         saveState();
+        
+        console.log('📋 Load Block: Initial render...');
         renderDashboard();
         renderWorkout();
+        
         notify('✅ Block loaded! Check Workout tab to continue.');
         showPage('Workout');
+        
+        // v7.40 FIX: Force re-render after page switch to ensure fresh data
+        console.log('📋 Load Block: Forcing final re-render...');
+        setTimeout(() => {
+          renderWorkout();
+          console.log('📋 Load Block: Final render complete!');
+          console.log('📋 Load Block: Verify currentBlock.programType:', state.currentBlock?.programType);
+        }, 100);
+        
+        console.log('📋 Load Block: Complete!');
       }
     });
     
@@ -2782,38 +4186,237 @@ function showBlockDetails(block) {
 }
 
 function exportBlock(block) {
-  let csv = 'Week,Day,Exercise,Prescribed Sets,Prescribed Reps,Prescribed Weight,Prescribed %,Completed,Actual Sets\n';
+  // v7.40: Export block as CSV for backup/restore
+  // v7.40 FIX: Added validation and support for both 'work' and 'exercises' fields
+  
+  if (!block) {
+    alert('⚠️ No training block to export. Generate a block first.');
+    console.error('Export failed: block is null or undefined');
+    return;
+  }
+  
+  if (!block.weeks || block.weeks.length === 0) {
+    alert('⚠️ Training block has no weeks. Cannot export empty block.');
+    console.error('Export failed: block.weeks is empty', block);
+    return;
+  }
+  
+  console.log('📤 Export: Starting export for block with', block.weeks.length, 'weeks');
+  
+  let csv = 'Week,Day,Exercise,Sets,Reps,Percentage,Notes\n';
+  let rowCount = 0;
   
   block.weeks.forEach((week, weekIdx) => {
-    week.days.forEach((day) => {
-      day.exercises.forEach((ex) => {
-        const prescWeight = ex.prescribedWeight || '';
-        const prescPct = ex.prescribedPct || '';
-        const completed = day.completed ? 'Yes' : 'No';
-        
-        let actualSetsStr = '';
-        if (day.completed && ex.actualSets) {
-          const workSets = ex.actualSets.filter(s => s.tag === 'work');
-          actualSetsStr = workSets.map(s => 
-            `${s.weight || '-'}×${s.reps || '-'}${s.rpe ? `@${s.rpe}` : ''}`
-          ).join('; ');
-        }
-        
-        csv += `${weekIdx + 1},${day.title},"${ex.name}",${ex.sets},${ex.reps},${prescWeight},${prescPct},${completed},"${actualSetsStr}"\n`;
+    if (!week.days || week.days.length === 0) {
+      console.warn(`📤 Export: Week ${weekIdx + 1} has no days, skipping`);
+      return;
+    }
+    
+    week.days.forEach((day, dayIdx) => {
+      // v7.40 FIX: Handle BOTH 'work' and 'exercises' fields
+      // Different parts of the app use different field names
+      const exercises = day.work || day.exercises || [];
+      
+      if (exercises.length === 0) {
+        console.warn(`📤 Export: Week ${weekIdx + 1}, Day ${dayIdx + 1} (${day.title}) has no exercises`);
+      }
+      
+      exercises.forEach((ex) => {
+        // Handle both percentage formats
+        const pct = ex.pct ? Math.round(ex.pct * 100) : 
+                    ex.prescribedPct ? ex.prescribedPct : '';
+        const notes = `${week.phase || 'accumulation'}|${day.title || 'workout'}`;
+        csv += `${weekIdx + 1},"${day.title || 'workout'}","${ex.name}",${ex.sets},${ex.reps},${pct},"${notes}"\n`;
+        rowCount++;
       });
     });
   });
+  
+  if (rowCount === 0) {
+    alert('⚠️ No exercises found in training block.\n\nThe block structure may be corrupted. Try regenerating your block.');
+    console.error('Export failed: No exercises found in block');
+    console.error('Block structure:', JSON.stringify(block, null, 2));
+    return;
+  }
+  
+  console.log(`📤 Export: Successfully exported ${rowCount} exercises from ${block.weeks.length} weeks`);
   
   const blob = new Blob([csv], { type: 'text/csv' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `LiftAI_${block.programType}_${block.startDateISO}.csv`;
+  a.download = `LiftAI_Block_${block.programType || 'general'}_${block.startDateISO || 'backup'}.csv`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-  notify('Block exported');
+  notify('✅ Training block exported as CSV');
+}
+
+// v7.35: Import training block from CSV
+function importBlock(csvText) {
+  try {
+    console.log('🔍 importBlock: Starting parse...');
+    const lines = csvText.trim().split('\n').filter(l => l.trim());
+    console.log('🔍 importBlock: Found', lines.length, 'lines');
+    
+    if (lines.length < 2) {
+      return { success: false, error: 'CSV file is empty or has only a header row' };
+    }
+    
+    // Parse header
+    const header = lines[0].toLowerCase();
+    console.log('🔍 importBlock: Header:', header);
+    
+    if (!header.includes('week') || !header.includes('exercise')) {
+      return { 
+        success: false, 
+        error: 'Invalid CSV format. Must have "Week" and "Exercise" columns.\n\nExpected format:\nWeek,Day,Exercise,Sets,Reps,Percentage,Notes\n\nActual header:\n' + lines[0]
+      };
+    }
+    
+    // Parse data with more flexible regex
+    const weeks = {};
+    let parsedLines = 0;
+    let skippedLines = 0;
+    
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      
+      // More flexible regex that handles quotes and missing fields
+      // Format: Week,"Day","Exercise",Sets,Reps,Percentage,"Notes"
+      const match = line.match(/^(\d+),?"?([^",]+)"?,?"?([^",]+)"?,?(\d+),?(\d+),?(\d*),?"?([^"]*)"?$/);
+      
+      if (!match) {
+        console.warn('🔍 importBlock: Skipped line', i, ':', line);
+        skippedLines++;
+        continue;
+      }
+      
+      const [, weekNum, dayTitle, exercise, sets, reps, pct, notes] = match;
+      const weekIdx = parseInt(weekNum) - 1;
+      
+      console.log('🔍 importBlock: Parsed - Week', weekNum, 'Day', dayTitle, 'Exercise', exercise);
+      
+      if (!weeks[weekIdx]) {
+        const noteParts = notes.split('|');
+        weeks[weekIdx] = {
+          weekIndex: weekIdx,
+          days: {},
+          phase: noteParts[0] || 'accumulation',
+          intensity: 0.75,
+          volFactor: 1.0
+        };
+      }
+      
+      if (!weeks[weekIdx].days[dayTitle]) {
+        // Determine kind based on day title
+        let kind = 'snatch';
+        const titleLower = dayTitle.toLowerCase();
+        if (titleLower.includes('clean') || titleLower.includes('jerk') || titleLower.includes('c&j')) {
+          kind = 'cj';
+        } else if (titleLower.includes('combined')) {
+          kind = 'combined';
+        } else if (titleLower.includes('strength')) {
+          kind = 'strength';
+        } else if (titleLower.includes('accessory') || titleLower.includes('hypertrophy')) {
+          kind = 'accessory';
+        }
+        
+        // Determine liftKey based on kind
+        let liftKey = '';
+        if (kind === 'snatch') liftKey = 'snatch';
+        else if (kind === 'cj') liftKey = 'cj';
+        else if (kind === 'combined') liftKey = 'snatch'; // Combined uses snatch as primary
+        
+        weeks[weekIdx].days[dayTitle] = {
+          dow: 0, // Will be assigned later
+          title: dayTitle,
+          kind,
+          liftKey,
+          completed: false,
+          completedDate: null,
+          work: []
+        };
+      }
+      
+      // Determine liftKey for this exercise
+      const exLower = exercise.toLowerCase();
+      let exLiftKey = '';
+      if (exLower.includes('snatch')) exLiftKey = 'snatch';
+      else if (exLower.includes('clean') || exLower.includes('jerk')) exLiftKey = 'cj';
+      else if (exLower.includes('front squat')) exLiftKey = 'fs';
+      else if (exLower.includes('back squat') || exLower.includes('squat')) exLiftKey = 'bs';
+      else if (exLower.includes('push press')) exLiftKey = 'pushPress';
+      else if (exLower.includes('press')) exLiftKey = 'strictPress';
+      
+      weeks[weekIdx].days[dayTitle].work.push({
+        name: exercise,
+        sets: parseInt(sets) || 0,
+        reps: parseInt(reps) || 0,
+        pct: pct ? parseFloat(pct) / 100 : 0,
+        liftKey: exLiftKey,
+        tag: 'work'
+      });
+      
+      parsedLines++;
+    }
+    
+    console.log('🔍 importBlock: Parsed', parsedLines, 'lines, skipped', skippedLines);
+    
+    if (parsedLines === 0) {
+      return { success: false, error: 'No valid exercises found in CSV. Check the format.' };
+    }
+    
+    // Convert to array format
+    const weeksArray = [];
+    const maxWeek = Math.max(...Object.keys(weeks).map(Number));
+    
+    for (let i = 0; i <= maxWeek; i++) {
+      if (weeks[i]) {
+        const daysArray = Object.values(weeks[i].days);
+        // Assign DOW based on order (Mon=1, Wed=3, Fri=5, etc.)
+        const daysPerWeek = daysArray.length;
+        daysArray.forEach((day, idx) => {
+          if (daysPerWeek === 3) {
+            day.dow = [1, 3, 5][idx] || idx; // Mon, Wed, Fri
+          } else if (daysPerWeek === 4) {
+            day.dow = [1, 2, 4, 5][idx] || idx; // Mon, Tue, Thu, Fri
+          } else if (daysPerWeek === 5) {
+            day.dow = [1, 2, 3, 4, 5][idx] || idx; // Mon-Fri
+          } else if (daysPerWeek === 6) {
+            day.dow = [1, 2, 3, 4, 5, 6][idx] || idx; // Mon-Sat
+          } else {
+            day.dow = idx + 1; // Fallback
+          }
+        });
+        
+        weeksArray.push({
+          ...weeks[i],
+          days: daysArray
+        });
+      }
+    }
+    
+    console.log('🔍 importBlock: Created', weeksArray.length, 'weeks');
+    
+    const block = {
+      id: 'imported_' + Date.now(),
+      programType: 'general',
+      blockLength: weeksArray.length,
+      startDateISO: new Date().toISOString().split('T')[0],
+      weeks: weeksArray,
+      currentWeek: 0
+    };
+    
+    console.log('🔍 importBlock: Success!', block);
+    return { success: true, block };
+    
+  } catch (err) {
+    console.error('🔍 importBlock: Exception:', err);
+    return { success: false, error: err.message + '\n\nStack: ' + err.stack };
+  }
 }
 
 function renderSessionSummary(session) {
@@ -2847,7 +4450,115 @@ function renderSettings() {
   if ($('settingsCJ')) $('settingsCJ').value = p.maxes?.cj ?? '';
   if ($('settingsFS')) $('settingsFS').value = p.maxes?.fs ?? '';
   if ($('settingsBS')) $('settingsBS').value = p.maxes?.bs ?? '';
+  
+  // PRODUCTION PATCH: Add User ID recovery card
+  addUserIdRecoveryCard();
 }
+
+// PRODUCTION PATCH: User ID Recovery System
+function addUserIdRecoveryCard() {
+  const settingsContainer = $('pageSettings');
+  if (!settingsContainer) return;
+  
+  // Check if already added
+  if (document.getElementById('userIdRecoveryCard')) return;
+  
+  const userId = getAnonymousUserId();
+  
+  const card = document.createElement('div');
+  card.id = 'userIdRecoveryCard';
+  card.className = 'card';
+  card.style.marginTop = '24px';
+  card.style.background = 'rgba(239, 68, 68, 0.05)';
+  card.style.borderColor = 'rgba(239, 68, 68, 0.3)';
+  
+  card.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span style="font-size:20px">⚠️</span>
+      <div class="card-title" style="margin:0">Your Cloud Sync User ID</div>
+    </div>
+    <div class="card-subtitle" style="margin-bottom:16px">
+      <strong>IMPORTANT:</strong> Save this ID to recover your cloud data if you clear browser cache
+    </div>
+    
+    <div style="padding:14px;background:rgba(0,0,0,0.3);border:1px solid rgba(239,68,68,0.4);border-radius:10px;margin-bottom:16px">
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">
+        Your User ID
+      </div>
+      <div style="font-family:monospace;font-size:13px;word-break:break-all;margin-bottom:10px;color:var(--primary);font-weight:600">
+        ${escapeHtml(userId)}
+      </div>
+      <button 
+        class="secondary small" 
+        onclick="navigator.clipboard.writeText('${userId}').then(() => notify('✅ User ID copied to clipboard!'))"
+        style="width:100%"
+      >
+        📋 Copy User ID
+      </button>
+    </div>
+    
+    <div class="form-group">
+      <label>Lost your data? Restore from User ID</label>
+      <div style="display:flex;gap:8px">
+        <input 
+          id="restoreUserIdInput" 
+          placeholder="Paste your saved User ID here" 
+          style="flex:1;font-family:monospace;font-size:13px"
+        />
+        <button class="primary small" onclick="window.restoreUserId()" style="min-width:100px">
+          🔄 Restore
+        </button>
+      </div>
+      <div style="font-size:12px;color:var(--text-dim);margin-top:8px">
+        This will replace your current ID and reload the page to access the old data.
+      </div>
+    </div>
+  `;
+  
+  // Insert before data management card or append to end
+  const cards = settingsContainer.querySelectorAll('.card');
+  if (cards.length > 0) {
+    const lastCard = cards[cards.length - 1];
+    lastCard.before(card);
+  } else {
+    settingsContainer.appendChild(card);
+  }
+}
+
+// Add restore function to window global scope
+window.restoreUserId = function() {
+  const input = $('restoreUserIdInput');
+  if (!input || !input.value.trim()) {
+    alert('Please enter a User ID');
+    return;
+  }
+  
+  const newUserId = input.value.trim();
+  
+  // Validate format
+  if (!newUserId.startsWith('athlete_')) {
+    alert('Invalid User ID format. User IDs should start with "athlete_"');
+    return;
+  }
+  
+  if (!confirm(
+    `⚠️ RESTORE USER ID\n\n` +
+    `This will replace your current User ID with:\n${newUserId}\n\n` +
+    `Your current local data will remain, but cloud sync will use the new ID.\n\n` +
+    `Continue?`
+  )) {
+    return;
+  }
+  
+  // Save new user ID
+  localStorage.setItem('liftai_user_id', newUserId);
+  
+  // Show success and reload
+  showCloudNotification('success', 'User ID restored! Reloading...');
+  setTimeout(() => {
+    location.reload();
+  }, 1500);
+};
 
 function isDayCompleted(weekIndex, dayIndex) {
   return (state.history || []).some(h => h.weekIndex === weekIndex && h.dayIndex === dayIndex && h.profileName === state.activeProfile);
@@ -3046,6 +4757,108 @@ function bindDaySelectorHandlers() {
   syncDaySelectorUI();
 }
 
+// ============================================================================
+// PRODUCTION PATCHES: Retry & Debounce Systems
+// ============================================================================
+
+// Global retry configuration
+const RETRY_CONFIG = {
+  maxAttempts: 3,
+  baseDelay: 1000, // 1 second
+  maxDelay: 5000   // 5 seconds max
+};
+
+/**
+ * Retry wrapper with exponential backoff
+ * @param {Function} operation - Async function to retry
+ * @param {string} operationName - Name for logging
+ * @param {number} maxRetries - Maximum retry attempts
+ * @returns {Promise} Result of operation
+ */
+async function retryWithBackoff(operation, operationName = 'Operation', maxRetries = RETRY_CONFIG.maxAttempts) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      console.warn(`${operationName} attempt ${attempt}/${maxRetries} failed:`, error);
+      
+      // Don't retry on client errors (4xx) - only network/server errors
+      if (error.code && error.code.toString().startsWith('4')) {
+        console.error(`${operationName} failed with client error - not retrying:`, error.code);
+        throw error;
+      }
+      
+      if (attempt < maxRetries) {
+        // Exponential backoff: 1s, 2s, 4s (capped at 5s)
+        const delay = Math.min(
+          RETRY_CONFIG.baseDelay * Math.pow(2, attempt - 1),
+          RETRY_CONFIG.maxDelay
+        );
+        
+        showCloudNotification('warning', `${operationName} failed. Retrying in ${delay/1000}s...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        showCloudNotification('error', `${operationName} failed after ${maxRetries} attempts`);
+        throw error;
+      }
+    }
+  }
+}
+
+// Global debounce state
+const buttonDebounce = new Map();
+
+/**
+ * Debounce a button click to prevent double-execution
+ * @param {string} buttonId - Unique identifier for the button
+ * @param {Function} callback - Function to execute
+ * @param {number} delay - Debounce delay in ms (default 1000)
+ */
+function debounceButton(buttonId, callback, delay = 1000) {
+  const now = Date.now();
+  const lastClick = buttonDebounce.get(buttonId) || 0;
+  
+  if (now - lastClick < delay) {
+    console.warn(`Button ${buttonId} debounced (${now - lastClick}ms since last click)`);
+    return false;
+  }
+  
+  buttonDebounce.set(buttonId, now);
+  
+  try {
+    callback();
+    return true;
+  } catch (error) {
+    console.error(`Error in ${buttonId} callback:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Create a debounced async button handler
+ * @param {string} buttonId - Button identifier
+ * @param {Function} asyncCallback - Async function to execute
+ * @param {number} delay - Debounce delay in ms
+ * @returns {Function} Debounced handler
+ */
+function createDebouncedHandler(buttonId, asyncCallback, delay = 2000) {
+  return async function() {
+    if (!debounceButton(buttonId, () => {}, delay)) {
+      return; // Still in debounce period
+    }
+    
+    try {
+      await asyncCallback();
+    } catch (error) {
+      console.error(`${buttonId} handler error:`, error);
+    }
+  };
+}
+
+// ============================================================================
+// END PRODUCTION PATCHES
+// ============================================================================
+
 function wireButtons() {
   $('btnAI')?.addEventListener('click', () => {
     openModal('🤖 AI Assistant', 'Placeholder', '<div class="help">AI features not enabled yet.</div>');
@@ -3091,7 +4904,12 @@ function wireButtons() {
       if (hint) hint.style.display = 'none';
     }
   });
-  $('btnGenerateBlock')?.addEventListener('click', generateBlockFromSetup);
+  // PRODUCTION PATCH: Debounce generate block
+  $('btnGenerateBlock')?.addEventListener('click', createDebouncedHandler(
+    'btnGenerateBlock',
+    generateBlockFromSetup,
+    2000
+  ));
   $('btnDemo')?.addEventListener('click', () => {
     const demo = { snatch: 80, cj: 100, fs: 130, bs: 150, pushPress: 70, strictPress: 55 };
     $('setupSnatch').value = demo.snatch;
@@ -3103,6 +4921,231 @@ function wireButtons() {
     notify('Demo maxes loaded');
   });
   $('btnGoWorkout')?.addEventListener('click', () => showPage('Workout'));
+  // PRODUCTION PATCH: Cloud sync with retry + debounce
+  $('btnPushCloud')?.addEventListener('click', createDebouncedHandler(
+    'btnPushCloud',
+    () => retryWithBackoff(pushToCloud, 'Cloud Save'),
+    2000 // 2 second debounce
+  ));
+  $('btnPullCloud')?.addEventListener('click', createDebouncedHandler(
+    'btnPullCloud',
+    pullFromCloud,
+    1000
+  ));
+  
+  // ========================================
+  // v7.41: Dashboard Import/Export Buttons
+  // ========================================
+  
+  // Export current block
+  $('btnExportCurrentBlock')?.addEventListener('click', () => {
+    const block = state.currentBlock;
+    if (!block) {
+      alert('⚠️ No training block to export. Generate a block first.');
+      return;
+    }
+    exportBlock(block);
+  });
+  
+  // Import block (uses unified system)
+  $('btnImportBlock')?.addEventListener('click', () => {
+    console.log('🔘 Dashboard Import button clicked');
+    triggerUnifiedImport('Dashboard');
+  });
+  
+  // ========================================
+  // v7.41: History Import Button
+  // NEW: Adds import capability to History tab
+  // ========================================
+  
+  $('btnImportBlock_History')?.addEventListener('click', () => {
+    console.log('🔘 History Import button clicked');
+    triggerUnifiedImport('History');
+  });
+  
+  // ========================================
+  // v7.41: UNIFIED IMPORT SYSTEM
+  // Location-agnostic import that updates ALL tabs
+  // ========================================
+  
+  /**
+   * Unified Training Block Import Handler
+   * Can be triggered from Dashboard, History, or any tab
+   * Updates global state and refreshes ALL views
+   * @param {string} csvText - The CSV content
+   * @param {string} sourceTab - Which tab triggered the import
+   * @returns {boolean} - Success status
+   */
+  function unifiedBlockImport(csvText, sourceTab = 'unknown') {
+    console.log(`📥 UNIFIED IMPORT: Starting from ${sourceTab} tab`);
+    console.log(`📥 UNIFIED IMPORT: CSV length: ${csvText.length} chars`);
+    
+    try {
+      // Parse the CSV using existing importBlock function
+      const result = importBlock(csvText);
+      
+      if (!result.success) {
+        console.error(`📥 UNIFIED IMPORT: Parse failed:`, result.error);
+        alert(`❌ Import failed: ${result.error}\n\nMake sure you're importing a Training Block CSV.\n\nExpected format:\nWeek,Day,Exercise,Sets,Reps,Percentage,Notes`);
+        return false;
+      }
+      
+      const block = result.block;
+      console.log(`📥 UNIFIED IMPORT: Parse successful`);
+      console.log(`📥 UNIFIED IMPORT: Block details:`, {
+        programType: block.programType,
+        weeks: block.weeks.length,
+        startDate: block.startDateISO
+      });
+      
+      // Calculate stats for confirmation dialog
+      const daysCount = block.weeks.reduce((sum, w) => sum + w.days.length, 0);
+      const exercisesCount = block.weeks.reduce((sum, w) => 
+        sum + w.days.reduce((s, d) => s + (d.work?.length || 0), 0), 0);
+      
+      console.log(`📥 UNIFIED IMPORT: Stats - ${daysCount} days, ${exercisesCount} exercises`);
+      
+      // Confirm with user
+      const confirmMsg = `Import training block?\n\n` +
+        `• Program: ${block.programType}\n` +
+        `• Length: ${block.weeks.length} weeks\n` +
+        `• Training days: ${daysCount}\n` +
+        `• Exercises: ${exercisesCount}\n\n` +
+        `This will REPLACE your current training block.`;
+      
+      if (!confirm(confirmMsg)) {
+        console.log(`📥 UNIFIED IMPORT: User cancelled`);
+        return false;
+      }
+      
+      // ========================================
+      // CRITICAL SECTION: Update Global State
+      // This is the single source of truth
+      // ========================================
+      console.log(`📥 UNIFIED IMPORT: Updating global state...`);
+      
+      state.currentBlock = block;
+      ui.weekIndex = 0; // Reset to week 1
+      
+      console.log(`📥 UNIFIED IMPORT: ✓ state.currentBlock updated`);
+      console.log(`📥 UNIFIED IMPORT: ✓ programType = "${state.currentBlock.programType}"`);
+      
+      // ========================================
+      // CRITICAL SECTION: Persist to localStorage
+      // Ensures data survives page refresh
+      // ========================================
+      console.log(`📥 UNIFIED IMPORT: Saving to localStorage...`);
+      saveState();
+      console.log(`📥 UNIFIED IMPORT: ✓ localStorage updated`);
+      
+      // ========================================
+      // CRITICAL SECTION: Refresh ALL Views
+      // MUST happen in this order
+      // ========================================
+      console.log(`📥 UNIFIED IMPORT: Refreshing all views...`);
+      
+      // 1. Dashboard (shows block summary)
+      renderDashboard();
+      console.log(`📥 UNIFIED IMPORT: ✓ Dashboard rendered`);
+      
+      // 2. Workout (shows training plan)
+      renderWorkout();
+      console.log(`📥 UNIFIED IMPORT: ✓ Workout rendered`);
+      
+      // 3. History (may show current block indicator)
+      renderHistory();
+      console.log(`📥 UNIFIED IMPORT: ✓ History rendered`);
+      
+      // ========================================
+      // Navigate to Workout tab
+      // ========================================
+      console.log(`📥 UNIFIED IMPORT: Navigating to Workout...`);
+      showPage('Workout');
+      
+      // Force final render after navigation completes
+      // This ensures the Workout tab is fully refreshed
+      setTimeout(() => {
+        renderWorkout();
+        renderDashboard(); // v7.41: Also re-render Dashboard to fix desync
+        console.log(`📥 UNIFIED IMPORT: ✓ Final render complete`);
+        console.log(`📥 UNIFIED IMPORT: Final verification:`, {
+          currentBlock: !!state.currentBlock,
+          programType: state.currentBlock?.programType,
+          weeks: state.currentBlock?.weeks?.length
+        });
+      }, 100);
+      
+      // Success notification
+      notify(`✅ Training block imported successfully!`);
+      console.log(`📥 UNIFIED IMPORT: ✅ Import complete!`);
+      
+      return true;
+      
+    } catch (err) {
+      console.error(`📥 UNIFIED IMPORT: Exception:`, err);
+      console.error(`📥 UNIFIED IMPORT: Stack:`, err.stack);
+      alert(`❌ Import failed: ${err.message}\n\nCheck the browser console (F12) for details.`);
+      return false;
+    }
+  }
+  
+  /**
+   * Trigger file picker for unified import
+   * Can be called from any tab
+   * @param {string} sourceTab - Identifies which tab triggered import
+   */
+  function triggerUnifiedImport(sourceTab = 'unknown') {
+    console.log(`📥 TRIGGER: Import requested from ${sourceTab}`);
+    const fileInput = $('fileImportBlock');
+    if (fileInput) {
+      // Store source for logging purposes
+      fileInput.dataset.sourceTab = sourceTab;
+      fileInput.click();
+      console.log(`📥 TRIGGER: File picker opened`);
+    } else {
+      console.error(`📥 TRIGGER: File input #fileImportBlock not found`);
+      alert('⚠️ Import button not properly initialized. Please refresh the page.');
+    }
+  }
+  
+  // ========================================
+  // v7.41: UNIFIED FILE INPUT HANDLER
+  // Single handler for ALL CSV imports
+  // ========================================
+  
+  $('fileImportBlock')?.addEventListener('change', (e) => {
+    const file = e.target.files?.[0];
+    if (!file) {
+      console.log(`📥 FILE HANDLER: No file selected`);
+      return;
+    }
+    
+    const sourceTab = e.target.dataset.sourceTab || 'unknown';
+    console.log(`📥 FILE HANDLER: File selected from ${sourceTab}:`, file.name, file.size);
+    
+    const reader = new FileReader();
+    
+    reader.onerror = (error) => {
+      console.error(`📥 FILE HANDLER: FileReader error:`, error);
+      alert(`❌ Failed to read file: ${error}`);
+    };
+    
+    reader.onload = (event) => {
+      const csvText = event.target.result;
+      console.log(`📥 FILE HANDLER: File read successfully, length: ${csvText.length}`);
+      console.log(`📥 FILE HANDLER: First 200 chars:`, csvText.substring(0, 200));
+      
+      // Call unified import handler
+      unifiedBlockImport(csvText, sourceTab);
+      
+      // Reset file input so same file can be selected again
+      e.target.value = '';
+      delete e.target.dataset.sourceTab;
+    };
+    
+    reader.readAsText(file);
+  });
+  
   $('btnLogReadiness')?.addEventListener('click', () => {
     const o = $('readinessOverlay');
     if (o) o.classList.add('show');
@@ -3118,13 +5161,157 @@ function wireButtons() {
     renderWorkout();
   });
   
-  // v7.24: Import button handler
+  // v7.32: CSV Import functionality
+// Supports format: Date,Exercise,Sets,Reps,Weight,RPE (or similar variations)
+function importCSV(csvText) {
+  try {
+    const lines = csvText.trim().split('\n').filter(line => line.trim());
+    if (lines.length < 2) {
+      return { success: false, error: 'CSV file is empty or has no data rows' };
+    }
+    
+    // Parse header
+    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+    const dateIdx = headers.findIndex(h => h.includes('date'));
+    const exerciseIdx = headers.findIndex(h => h.includes('exercise') || h.includes('lift') || h.includes('movement'));
+    const setsIdx = headers.findIndex(h => h.includes('set'));
+    const repsIdx = headers.findIndex(h => h.includes('rep'));
+    const weightIdx = headers.findIndex(h => h.includes('weight') || h.includes('load') || h.includes('kg') || h.includes('lb'));
+    const rpeIdx = headers.findIndex(h => h.includes('rpe') || h.includes('rir') || h.includes('effort'));
+    
+    if (dateIdx === -1 || exerciseIdx === -1) {
+      return { success: false, error: 'CSV must have Date and Exercise columns' };
+    }
+    
+    // Parse data rows
+    const workouts = {};
+    const exerciseMaxes = {}; // Track best lifts for max estimation
+    let totalExercises = 0;
+    
+    for (let i = 1; i < lines.length; i++) {
+      const cells = lines[i].split(',').map(c => c.trim());
+      if (cells.length < 2) continue;
+      
+      const date = cells[dateIdx];
+      const exercise = cells[exerciseIdx];
+      const sets = setsIdx >= 0 ? parseInt(cells[setsIdx]) || 1 : 1;
+      const reps = repsIdx >= 0 ? parseInt(cells[repsIdx]) || 1 : 1;
+      const weight = weightIdx >= 0 ? parseFloat(cells[weightIdx]) || 0 : 0;
+      const rpe = rpeIdx >= 0 ? parseFloat(cells[rpeIdx]) || 0 : 0;
+      
+      if (!date || !exercise) continue;
+      
+      // Group by date
+      if (!workouts[date]) workouts[date] = [];
+      workouts[date].push({ exercise, sets, reps, weight, rpe });
+      totalExercises++;
+      
+      // Track maxes for estimation (only for main lifts with weight)
+      if (weight > 0 && reps > 0 && reps <= 10) {
+        const exerciseLower = exercise.toLowerCase();
+        const isMainLift = exerciseLower.includes('snatch') || 
+                          exerciseLower.includes('clean') || 
+                          exerciseLower.includes('jerk') ||
+                          exerciseLower.includes('squat') ||
+                          exerciseLower.includes('press');
+        
+        if (isMainLift) {
+          // Estimate 1RM using Epley formula: weight × (1 + reps/30)
+          const estimated1RM = weight * (1 + reps / 30);
+          
+          if (!exerciseMaxes[exercise] || estimated1RM > exerciseMaxes[exercise].estimated1RM) {
+            exerciseMaxes[exercise] = {
+              weight,
+              reps,
+              rpe,
+              estimated1RM: Math.round(estimated1RM)
+            };
+          }
+        }
+      }
+    }
+    
+    if (Object.keys(workouts).length === 0) {
+      return { success: false, error: 'No valid workout data found in CSV' };
+    }
+    
+    // Add to history (create simple workout log format)
+    state.history = state.history || [];
+    Object.keys(workouts).forEach(date => {
+      const existingIdx = state.history.findIndex(h => h.date === date);
+      if (existingIdx >= 0) {
+        // Merge with existing workout
+        state.history[existingIdx].exercises = [
+          ...state.history[existingIdx].exercises,
+          ...workouts[date]
+        ];
+      } else {
+        // Create new workout entry
+        state.history.push({
+          date,
+          exercises: workouts[date],
+          source: 'csv_import'
+        });
+      }
+    });
+    
+    // Update user maxes if we found better estimates
+    const profile = getProfile();
+    let maxesUpdated = false;
+    
+    Object.keys(exerciseMaxes).forEach(exercise => {
+      const exerciseLower = exercise.toLowerCase();
+      const max = exerciseMaxes[exercise];
+      
+      // Map to standard lift keys
+      if (exerciseLower.includes('snatch') && !exerciseLower.includes('power')) {
+        if (!profile.maxes.snatch || max.estimated1RM > profile.maxes.snatch) {
+          profile.maxes.snatch = max.estimated1RM;
+          maxesUpdated = true;
+        }
+      }
+      else if (exerciseLower.includes('clean') && (exerciseLower.includes('jerk') || exerciseLower.includes('c&j'))) {
+        if (!profile.maxes.cj || max.estimated1RM > profile.maxes.cj) {
+          profile.maxes.cj = max.estimated1RM;
+          maxesUpdated = true;
+        }
+      }
+      else if (exerciseLower.includes('back squat') || (exerciseLower.includes('squat') && exerciseLower.includes('back'))) {
+        if (!profile.maxes.bs || max.estimated1RM > profile.maxes.bs) {
+          profile.maxes.bs = max.estimated1RM;
+          maxesUpdated = true;
+        }
+      }
+      else if (exerciseLower.includes('front squat') || (exerciseLower.includes('squat') && exerciseLower.includes('front'))) {
+        if (!profile.maxes.fs || max.estimated1RM > profile.maxes.fs) {
+          profile.maxes.fs = max.estimated1RM;
+          maxesUpdated = true;
+        }
+      }
+    });
+    
+    return {
+      success: true,
+      workouts: Object.keys(workouts).length,
+      exercises: totalExercises,
+      maxesUpdated
+    };
+    
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// v7.24: Import button handler
   $('btnImport')?.addEventListener('click', () => {
     const fileInput = $('fileImport');
     if (fileInput) fileInput.click();
   });
   
-  // v7.24: File import handler
+  // v7.41: Old workout log CSV import removed
+  // History tab now uses unified training block import via btnImportBlock_History
+  
+  // v7.24: File import handler (JSON)
   $('fileImport')?.addEventListener('change', (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -3266,14 +5453,180 @@ function wireButtons() {
 }
 
 function boot() {
-  wireButtons();
-  bindWorkoutDetailControls();
-  bindReadinessModal();
-  ensureDaySelectorsBound();
-  showPage('Setup');
-  if (state.currentBlock && state.currentBlock.weeks?.length) {
-    ui.weekIndex = 0;
+  console.log('🚀 Starting boot sequence...');
+  
+  // Track initialization status
+  const initStatus = {
+    wireButtons: false,
+    workoutDetail: false,
+    readiness: false,
+    daySelectors: false,
+    page: false,
+    supabase: false
+  };
+  
+  // Step 1: Wire buttons (critical)
+  try {
+    wireButtons();
+    initStatus.wireButtons = true;
+    console.log('✓ Buttons wired');
+  } catch (error) {
+    console.error('✗ Failed to wire buttons:', error);
+  }
+  
+  // Step 2: Bind workout detail controls
+  try {
+    bindWorkoutDetailControls();
+    initStatus.workoutDetail = true;
+    console.log('✓ Workout detail controls bound');
+  } catch (error) {
+    console.error('✗ Failed to bind workout detail controls:', error);
+  }
+  
+  // Step 3: Bind readiness modal
+  try {
+    bindReadinessModal();
+    initStatus.readiness = true;
+    console.log('✓ Readiness modal bound');
+  } catch (error) {
+    console.error('✗ Failed to bind readiness modal:', error);
+  }
+  
+  // Step 4: Ensure day selectors bound
+  try {
+    ensureDaySelectorsBound();
+    initStatus.daySelectors = true;
+    console.log('✓ Day selectors bound');
+  } catch (error) {
+    console.error('✗ Failed to bind day selectors:', error);
+  }
+  
+  // Step 5: Show initial page
+  try {
+    showPage('Setup');
+    initStatus.page = true;
+    console.log('✓ Initial page shown');
+  } catch (error) {
+    console.error('✗ Failed to show page:', error);
+  }
+  
+  // Step 6: Initialize week index
+  try {
+    if (state.currentBlock && state.currentBlock.weeks?.length) {
+      ui.weekIndex = 0;
+    }
+    console.log('✓ Week index set');
+  } catch (error) {
+    console.error('✗ Failed to set week index:', error);
+  }
+  
+  // Step 7: Initialize cloud sync (non-critical)
+  try {
+    initSupabase();
+    initStatus.supabase = true;
+    console.log('✓ Supabase initialization started');
+  } catch (error) {
+    console.error('✗ Failed to initialize Supabase:', error);
+  }
+  
+  // Report initialization status
+  const failed = Object.keys(initStatus).filter(k => !initStatus[k]);
+  if (failed.length === 0) {
+    console.log('✅ Boot complete - all systems operational');
+  } else {
+    console.warn(`⚠️ Boot complete with failures: ${failed.join(', ')}`);
+  }
+  
+  // Make boot status available globally for debugging
+  window.liftaiBootStatus = initStatus;
+  
+  // Set up global event delegation for dynamically created elements
+  setupGlobalEventDelegation();
+}
+
+/**
+ * Global event delegation handler
+ * Handles events for dynamically created elements without re-binding
+ */
+function setupGlobalEventDelegation() {
+  console.log('Setting up global event delegation...');
+  
+  // Delegate all clicks on the document body
+  document.body.addEventListener('click', function(e) {
+    const target = e.target;
+    
+    // Handle data-action attributes
+    const action = target.getAttribute('data-action');
+    if (action) {
+      e.preventDefault();
+      handleDataAction(action, target);
+      return;
+    }
+    
+    // Handle buttons with specific IDs dynamically created
+    if (target.id && target.tagName === 'BUTTON') {
+      // Check for day selection buttons
+      if (target.id.startsWith('daySelect_')) {
+        const dayNum = parseInt(target.id.split('_')[1]);
+        if (!isNaN(dayNum)) {
+          toggleDaySelection(dayNum);
+          return;
+        }
+      }
+      
+      // Check for accessory day selection
+      if (target.id.startsWith('accDaySelect_')) {
+        const dayNum = parseInt(target.id.split('_')[1]);
+        if (!isNaN(dayNum)) {
+          toggleAccessoryDaySelection(dayNum);
+          return;
+        }
+      }
+    }
+  });
+  
+  console.log('✓ Global event delegation ready');
+}
+
+/**
+ * Handle data-action attributes
+ */
+function handleDataAction(action, element) {
+  const actions = {
+    'open-workout-detail': () => {
+      const weekIndex = parseInt(element.getAttribute('data-week-index'));
+      const dayIndex = parseInt(element.getAttribute('data-day-index'));
+      if (!isNaN(weekIndex) && !isNaN(dayIndex)) {
+        const weekData = state.currentBlock?.weeks[weekIndex];
+        if (weekData) {
+          openWorkoutDetail(weekIndex, dayIndex, weekData.days[dayIndex]);
+        }
+      }
+    },
+    'toggle-set-complete': () => {
+      const setKey = element.getAttribute('data-set-key');
+      if (setKey) {
+        toggleSetComplete(setKey);
+      }
+    },
+    'start-rest-timer': () => {
+      const exerciseKey = element.getAttribute('data-exercise-key');
+      const duration = parseInt(element.getAttribute('data-duration')) || 180;
+      if (exerciseKey) {
+        startRestTimer(duration, exerciseKey);
+      }
+    }
+  };
+  
+  const handler = actions[action];
+  if (handler) {
+    try {
+      handler();
+    } catch (error) {
+      console.error(`Error handling action ${action}:`, error);
+    }
   }
 }
 
-document.addEventListener('DOMContentLoaded', boot);
+// Boot function will be called from index.html
+// REMOVED: document.addEventListener('DOMContentLoaded', boot);
