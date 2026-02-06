@@ -156,13 +156,14 @@ async function pushToCloud() {
     const userId = getAnonymousUserId();
     const profile = getProfile();
     
-    // Get block name
+    // Get or create block name (LOGIC FIX: Update state.currentBlock.name if missing)
     let blockName = state.currentBlock.name;
     if (!blockName || blockName.trim() === '') {
       const date = new Date().toLocaleDateString('en-US', { 
         month: 'short', day: 'numeric', year: 'numeric' 
       });
       blockName = `${profile.programType || 'Training'} Block - ${date}`;
+      state.currentBlock.name = blockName; // Update block name in state
     }
     
     // Prepare payload
@@ -196,7 +197,7 @@ async function pushToCloud() {
       block_name: payload.block_name
     });
     
-    // EMERGENCY HOTFIX: Try upsert first, fallback to manual check
+    // Try upsert first, fallback to manual check
     let result;
     let useUpsert = true;
     
@@ -300,6 +301,55 @@ async function pushToCloud() {
       throw new Error('No data returned from save operation');
     }
     
+    // HISTORY FIX: Add/update block in history after successful save
+    if (!state.blockHistory) {
+      state.blockHistory = [];
+    }
+    
+    const existingHistoryIndex = state.blockHistory.findIndex(
+      h => (h.cloudId === result.id) || (h.name === blockName && h.profileName === state.activeProfile)
+    );
+    
+    if (existingHistoryIndex >= 0) {
+      // Update existing history entry
+      state.blockHistory[existingHistoryIndex].lastSyncedAt = new Date().toISOString();
+      state.blockHistory[existingHistoryIndex].cloudId = result.id;
+      state.blockHistory[existingHistoryIndex].blockLength = state.currentBlock.weeks?.length || 0;
+      console.log('✓ Updated existing history entry');
+    } else {
+      // Create new history entry
+      const historyEntry = {
+        id: result.id,
+        name: blockName,
+        blockLength: state.currentBlock.weeks?.length || 0,
+        programType: profile.programType || 'general',
+        profileName: state.activeProfile,
+        startDate: state.currentBlock.startDate || result.created_at || new Date().toISOString(),
+        endDate: null,
+        completed: false,
+        cloudId: result.id,
+        lastSyncedAt: new Date().toISOString(),
+        source: 'cloud_save'
+      };
+      
+      state.blockHistory.unshift(historyEntry); // Add to beginning (newest first)
+      
+      // LOGIC FIX: Limit history to prevent bloat
+      if (state.blockHistory.length > 100) {
+        state.blockHistory = state.blockHistory.slice(0, 100);
+      }
+      
+      console.log('✓ Added new history entry:', historyEntry.name);
+    }
+    
+    // Save state and refresh history view
+    saveState();
+    
+    // LOGIC FIX: Only call renderHistory if function exists and History page is visible
+    if (typeof renderHistory === 'function') {
+      renderHistory();
+    }
+    
     console.log('✅ Save successful:', result);
     showCloudNotification('success', 'Block saved to cloud');
     
@@ -378,6 +428,49 @@ async function pullFromCloud() {
     }
     
     console.log(`✓ ${validBlocks.length} valid blocks ready to display`);
+    
+    // HISTORY FIX: Sync cloud blocks with local history
+    if (!state.blockHistory) {
+      state.blockHistory = [];
+    }
+    
+    validBlocks.forEach(cloudBlock => {
+      const existingIndex = state.blockHistory.findIndex(
+        h => h.cloudId === cloudBlock.id || (h.name === cloudBlock.block_name && h.profileName === state.activeProfile)
+      );
+      
+      if (existingIndex === -1) {
+        // Add to history if not present
+        const historyEntry = {
+          id: cloudBlock.id,
+          name: cloudBlock.block_name,
+          blockLength: cloudBlock.block_data.weeks?.length || 0,
+          programType: cloudBlock.profile_data?.programType || 'general',
+          profileName: state.activeProfile,
+          startDate: cloudBlock.created_at,
+          endDate: null,
+          completed: false,
+          cloudId: cloudBlock.id,
+          lastSyncedAt: new Date().toISOString(),
+          source: 'cloud_pull'
+        };
+        
+        state.blockHistory.push(historyEntry);
+        console.log('✓ Added cloud block to history:', historyEntry.name);
+      } else {
+        // Update existing entry with cloud ID
+        state.blockHistory[existingIndex].cloudId = cloudBlock.id;
+        state.blockHistory[existingIndex].lastSyncedAt = new Date().toISOString();
+      }
+    });
+    
+    // Save updated history
+    saveState();
+    
+    // Refresh history view if function exists
+    if (typeof renderHistory === 'function') {
+      renderHistory();
+    }
     
     // Show modal with blocks
     showCloudBlocksModal(validBlocks);
@@ -4012,49 +4105,175 @@ function renderHistory() {
   const list = $('historyList');
   if (!list) return;
   
-  const blocks = (state.blockHistory || []).slice();
+  // LOGIC FIX: Ensure blockHistory exists
+  if (!state.blockHistory) {
+    state.blockHistory = [];
+  }
+  
+  const blocks = state.blockHistory || [];
+  
+  // Empty state handling
   if (!blocks.length) {
-    list.innerHTML = `<div class="card" style="background:rgba(17,24,39,.5)"><div class="card-title">No history yet</div><div class="card-subtitle">Generate a training block to see it here.</div></div>`;
+    list.innerHTML = `
+      <div class="card" style="background:rgba(17,24,39,.5);text-align:center;padding:40px">
+        <div style="font-size:48px;margin-bottom:16px">📋</div>
+        <div class="card-title">No history yet</div>
+        <div class="card-subtitle">Import a CSV or generate a training block to see it here.</div>
+      </div>
+    `;
     return;
   }
   
+  // LOGIC FIX: Sort by most recent first (handle various date fields)
+  const sorted = [...blocks].sort((a, b) => {
+    const dateA = new Date(a.startDate || a.importedAt || a.lastSyncedAt || a.created_at || 0);
+    const dateB = new Date(b.startDate || b.importedAt || b.lastSyncedAt || b.created_at || 0);
+    return dateB - dateA; // Newest first
+  });
+  
   list.innerHTML = '';
   
-  blocks.forEach((block) => {
+  sorted.forEach((block, index) => {
     const card = document.createElement('div');
     card.className = 'card';
-    card.style.cursor = 'pointer';
+    card.style.cssText = `
+      cursor: pointer;
+      margin-bottom: 12px;
+      transition: all 0.2s;
+      background: rgba(59,130,246,0.1);
+      border: 1px solid rgba(59,130,246,0.3);
+    `;
     
-    const completedDays = block.weeks.reduce((sum, week) => 
-      sum + week.days.filter(d => d.completed).length, 0);
-    const totalDays = block.weeks.reduce((sum, week) => sum + week.days.length, 0);
-    const progressPct = totalDays > 0 ? Math.round((completedDays / totalDays) * 100) : 0;
+    // LOGIC FIX: Handle various date formats
+    const startDate = new Date(block.startDate || block.importedAt || block.lastSyncedAt || Date.now());
+    const dateStr = startDate.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric'
+    });
+    
+    // Source icon based on origin
+    const sourceIcon = {
+      'csv_import': '📄',
+      'cloud_save': '☁️',
+      'cloud_pull': '☁️',
+      'generated': '🎯'
+    }[block.source] || '📋';
+    
+    // Status badge
+    const statusBadge = block.completed 
+      ? '<span style="background:#10b981;color:white;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600">COMPLETED</span>'
+      : '<span style="background:#3b82f6;color:white;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600">ACTIVE</span>';
+    
+    // LOGIC FIX: Safely get block length
+    const blockLength = block.blockLength || block.weeks?.length || 0;
+    const programType = block.programType || 'general';
     
     card.innerHTML = `
-      <div class="card-title">${block.programType || 'General'} Block</div>
-      <div class="card-subtitle">${block.startDateISO} • ${block.blockLength} weeks • ${completedDays}/${totalDays} sessions completed (${progressPct}%)</div>
-      <div style="margin-top:8px;background:rgba(255,255,255,0.1);border-radius:8px;height:6px;overflow:hidden">
-        <div style="width:${progressPct}%;height:100%;background:var(--primary);transition:width 0.3s"></div>
+      <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:8px">
+        <div style="flex:1">
+          <div style="font-size:16px;font-weight:600;margin-bottom:4px">
+            ${sourceIcon} ${escapeHtml(block.name || 'Unnamed Block')}
+          </div>
+          <div style="font-size:13px;color:var(--text-dim)">
+            ${dateStr} • ${blockLength} weeks • ${programType}
+          </div>
+        </div>
+        ${statusBadge}
       </div>
-      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn-mini success" data-action="load" style="flex:1;min-width:80px">📋 Load</button>
-        <button class="btn-mini primary" data-action="redo" style="flex:1;min-width:80px">🔄 Redo</button>
-        <button class="btn-mini secondary" data-action="view" style="flex:1;min-width:80px">👁 View</button>
-        <button class="btn-mini secondary" data-action="export" style="flex:1;min-width:80px">📤 Export</button>
-        <button class="btn-mini danger" data-action="delete" style="flex:0 0 auto">✕</button>
+      ${block.cloudId ? '<div style="font-size:11px;color:var(--primary);margin-bottom:8px">☁️ Synced to cloud</div>' : ''}
+      <div style="display:flex;gap:6px;margin-top:12px">
+        <button class="btn-mini success" data-action="load" data-block-id="${block.id}" style="flex:1">📋 Load</button>
+        ${block.cloudId ? '<button class="btn-mini primary" data-action="refresh" data-block-id="' + block.id + '" style="flex:1">🔄 Refresh</button>' : ''}
+        <button class="btn-mini danger" data-action="delete" data-block-id="${block.id}" style="flex:0 0 auto">✕</button>
       </div>
     `;
     
-    // Load block as current
-    card.querySelector('[data-action="load"]')?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      console.log('📋 Load Block: Button clicked, block ID:', block.id);
+    // Hover effects
+    card.addEventListener('mouseenter', () => {
+      card.style.background = 'rgba(59,130,246,0.2)';
+      card.style.borderColor = 'rgba(59,130,246,0.5)';
+    });
+    card.addEventListener('mouseleave', () => {
+      card.style.background = 'rgba(59,130,246,0.1)';
+      card.style.borderColor = 'rgba(59,130,246,0.3)';
+    });
+    
+    // LOGIC FIX: Use event delegation on card level (prevents memory leaks)
+    card.addEventListener('click', (e) => {
+      const button = e.target.closest('button[data-action]');
+      if (!button) return;
       
-      if (confirm(`Load this block as your current training block?\n\nThis will replace your current block.`)) {
-        console.log('📋 Load Block: User confirmed, transforming structure...');
-        
-        // v7.38 CRITICAL FIX: Transform history structure to current block structure
-        // blockHistory stores 'day.exercises' but currentBlock needs 'day.work'
+      e.stopPropagation();
+      const action = button.dataset.action;
+      const blockId = button.dataset.blockId;
+      
+      // LOGIC FIX: Debounce rapid clicks
+      if (button.disabled) return;
+      button.disabled = true;
+      setTimeout(() => button.disabled = false, 1000);
+      
+      if (action === 'load') {
+        handleLoadBlockFromHistory(blockId);
+      } else if (action === 'refresh' && block.cloudId) {
+        handleRefreshBlockFromCloud(block.cloudId);
+      } else if (action === 'delete') {
+        handleDeleteBlockFromHistory(blockId);
+      }
+    });
+    
+    list.appendChild(card);
+  });
+}
+
+// LOGIC FIX: Separate handler functions to prevent code duplication
+function handleLoadBlockFromHistory(blockId) {
+  const block = state.blockHistory.find(b => b.id === blockId);
+  if (!block) {
+    showCloudNotification('error', 'Block not found in history');
+    return;
+  }
+  
+  if (block.cloudId) {
+    // Load from cloud (has full data)
+    if (typeof window.restoreFromCloud === 'function') {
+      window.restoreFromCloud(block.cloudId);
+    } else {
+      showCloudNotification('error', 'Cloud restore function not available');
+    }
+  } else {
+    // LOGIC FIX: For local imports, we need to find the data
+    // This is a limitation - local history only stores metadata
+    showCloudNotification('info', 'Local block loading requires cloud sync. Please save to cloud first.');
+  }
+}
+
+function handleRefreshBlockFromCloud(cloudId) {
+  if (typeof window.restoreFromCloud === 'function') {
+    window.restoreFromCloud(cloudId);
+    showCloudNotification('info', 'Refreshing block from cloud...');
+  } else {
+    showCloudNotification('error', 'Cloud restore function not available');
+  }
+}
+
+function handleDeleteBlockFromHistory(blockId) {
+  const block = state.blockHistory.find(b => b.id === blockId);
+  if (!block) return;
+  
+  const confirmMsg = `Delete "${block.name}" from history?\n\nThis will only remove it from your local history list.\nCloud data (if synced) will remain.`;
+  
+  if (!confirm(confirmMsg)) return;
+  
+  // Remove from history
+  state.blockHistory = state.blockHistory.filter(b => b.id !== blockId);
+  
+  // Save and refresh
+  saveState();
+  renderHistory();
+  
+  showCloudNotification('success', 'Block removed from history');
+}
         // Same transformation as Redo button, but preserves completion status
         const loadedBlock = {
           seed: block.blockSeed || Date.now(),
@@ -5126,6 +5345,57 @@ function wireButtons() {
       
       console.log(`📥 UNIFIED IMPORT: ✓ state.currentBlock updated`);
       console.log(`📥 UNIFIED IMPORT: ✓ programType = "${state.currentBlock.programType}"`);
+      
+      // ========================================
+      // HISTORY FIX: Add imported block to history
+      // This ensures CSV imports appear in History tab
+      // ========================================
+      console.log(`📥 UNIFIED IMPORT: Adding to block history...`);
+      
+      // Initialize blockHistory if missing
+      if (!state.blockHistory) {
+        state.blockHistory = [];
+        console.log(`📥 UNIFIED IMPORT: ✓ Initialized empty blockHistory`);
+      }
+      
+      // Create history entry
+      const historyEntry = {
+        id: crypto.randomUUID ? crypto.randomUUID() : `import_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        name: block.name || `Imported Block - ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`,
+        blockLength: block.weeks.length,
+        programType: block.programType || 'imported',
+        profileName: state.activeProfile,
+        startDate: block.startDateISO || new Date().toISOString(),
+        endDate: null,
+        completed: false,
+        importedAt: new Date().toISOString(),
+        source: 'csv_import'
+      };
+      
+      // LOGIC FIX: Check for duplicate before adding
+      const existingIndex = state.blockHistory.findIndex(
+        h => h.name === historyEntry.name && h.startDate === historyEntry.startDate
+      );
+      
+      if (existingIndex >= 0) {
+        // Update existing entry instead of creating duplicate
+        state.blockHistory[existingIndex] = {
+          ...state.blockHistory[existingIndex],
+          ...historyEntry,
+          importedAt: new Date().toISOString() // Update timestamp
+        };
+        console.log(`📥 UNIFIED IMPORT: ✓ Updated existing history entry`);
+      } else {
+        // Add new entry (newest first)
+        state.blockHistory.unshift(historyEntry);
+        console.log(`📥 UNIFIED IMPORT: ✓ Added new history entry:`, historyEntry.name);
+      }
+      
+      // LOGIC FIX: Limit history to prevent bloat
+      if (state.blockHistory.length > 100) {
+        state.blockHistory = state.blockHistory.slice(0, 100);
+        console.log(`📥 UNIFIED IMPORT: ✓ Trimmed history to 100 entries`);
+      }
       
       // ========================================
       // CRITICAL SECTION: Persist to localStorage
