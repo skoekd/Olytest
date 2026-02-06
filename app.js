@@ -6766,21 +6766,24 @@ function setupGlobalEventDelegation() {
   
   // Delegate all clicks on the document body
   document.body.addEventListener('click', function(e) {
-    const target = e.target;
+    let target = e.target;
     
-    // Handle data-action attributes
-    const action = target.getAttribute('data-action');
-    if (action) {
+    // Handle data-action attributes - check the target and its parents
+    // This ensures clicks on child elements (like icons inside buttons) work
+    const actionElement = target.closest('[data-action]');
+    if (actionElement) {
+      const action = actionElement.getAttribute('data-action');
       e.preventDefault();
-      handleDataAction(action, target);
+      handleDataAction(action, actionElement);
       return;
     }
     
     // Handle buttons with specific IDs dynamically created
-    if (target.id && target.tagName === 'BUTTON') {
+    const button = target.closest('button');
+    if (button && button.id) {
       // Check for day selection buttons
-      if (target.id.startsWith('daySelect_')) {
-        const dayNum = parseInt(target.id.split('_')[1]);
+      if (button.id.startsWith('daySelect_')) {
+        const dayNum = parseInt(button.id.split('_')[1]);
         if (!isNaN(dayNum)) {
           toggleDaySelection(dayNum);
           return;
@@ -6788,8 +6791,8 @@ function setupGlobalEventDelegation() {
       }
       
       // Check for accessory day selection
-      if (target.id.startsWith('accDaySelect_')) {
-        const dayNum = parseInt(target.id.split('_')[1]);
+      if (button.id.startsWith('accDaySelect_')) {
+        const dayNum = parseInt(button.id.split('_')[1]);
         if (!isNaN(dayNum)) {
           toggleAccessoryDaySelection(dayNum);
           return;
@@ -6843,3 +6846,6 @@ function handleDataAction(action, element) {
 
 // Boot function will be called from index.html
 // REMOVED: document.addEventListener('DOMContentLoaded', boot);
+
+// Expose boot function to global window object for HTML initialization
+window.initApp = boot;
